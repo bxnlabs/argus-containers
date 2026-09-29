@@ -94,7 +94,76 @@ check_update_env() {
   fi
 }
 
-checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env)
+# supervisord as an arbitrary non-root UID over empty HOME and state
+# directories, as a profile runs it.
+check_supervisord() {
+  local work cid out
+  work=$(mktemp -d)
+  mkdir -p "$work/home" "$work/ts"
+  chmod 0777 "$work/home" "$work/ts"
+  cid=$(docker run -d --user 12345:12345 -e HOME=/home/smoke \
+    -v "$work/home:/home/smoke" -v "$work/ts:/var/lib/tailscale" \
+    "$image" /usr/bin/supervisord -c /etc/supervisor/supervisord.conf)
+
+  if retry 30 docker exec "$cid" sh -c 'test -f "$HOME/.zshrc" && test -L "$HOME/.oh-my-zsh"'; then
+    pass "home-bootstrap seeded an empty HOME"
+  else
+    fail "home-bootstrap did not seed HOME"
+    docker exec "$cid" cat /opt/argus/share/supervisor/home-bootstrap.log
+  fi
+
+  if retry 30 docker exec "$cid" bash -c 'exec 3<>/dev/tcp/localhost/1055'; then
+    pass "tailscaled's proxy accepts connections on localhost:1055"
+  else
+    fail "nothing is listening on localhost:1055"
+    docker exec "$cid" tail -n 30 /opt/argus/share/supervisor/tailscaled.log
+  fi
+
+  if out=$(docker exec "$cid" /opt/argus/bin/wait-proxy 2>&1) && [[ -z $out ]]; then
+    pass "wait-proxy returns silently once the proxy is up"
+  else
+    fail "wait-proxy with the proxy up: $out"
+  fi
+
+  docker rm -f "$cid" >/dev/null
+  # Files written by UID 12345 are not removable by the runner's user.
+  docker run --rm -v "$work:/w" "$image" rm -rf /w/home /w/ts
+  rmdir "$work"
+}
+
+check_wait_proxy_timeout() {
+  local out
+  if out=$(docker run --rm -e WAIT_PROXY_TIMEOUT=2 "$image" bash -c '
+      start=$SECONDS
+      /opt/argus/bin/wait-proxy 2>/tmp/err
+      rc=$?
+      elapsed=$((SECONDS - start))
+      cat /tmp/err
+      [ "$rc" -eq 0 ] && [ "$elapsed" -le 5 ] && grep -q "not accepting connections" /tmp/err' 2>&1); then
+    pass "wait-proxy warns and returns 0 when tailscaled is down"
+  else
+    fail "wait-proxy without tailscaled: $out"
+  fi
+}
+
+check_env_sh() {
+  local got want image_env
+  got=$(docker run --rm "$image" sh -c '. /opt/argus/etc/env.sh && env' | grep -iE '^(all|http|https|no)_proxy=' | sort)
+  want=$(printf '%s\n' \
+    ALL_PROXY=http://localhost:1055 all_proxy=http://localhost:1055 \
+    HTTP_PROXY=http://localhost:1055 http_proxy=http://localhost:1055 \
+    HTTPS_PROXY=http://localhost:1055 https_proxy=http://localhost:1055 \
+    NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 | sort)
+  if [[ $got == "$want" ]]; then pass "env.sh exports the proxy variables"; else fail "env.sh exports:"$'\n'"$got"; fi
+  image_env=$(docker image inspect --format '{{json .Config.Env}}' "$image")
+  if grep -qi proxy <<<"$image_env"; then
+    fail "image ENV sets a proxy variable: $image_env"
+  else
+    pass "image ENV has no proxy variables"
+  fi
+}
+
+checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_wait_proxy_timeout check_env_sh)
 for c in "${checks[@]}"; do "$c"; done
 
 if ((failures)); then

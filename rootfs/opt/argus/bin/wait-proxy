@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Wait for tailscaled's proxy on localhost:1055 before a session starts. On a
+# cold stack start the session can begin while tailscaled is still coming up.
+#
+# Best-effort: on timeout it warns and exits 0. Argus sources hooks
+# non-fatally, and a hook must never block session start.
+set -u
+
+timeout_s=${WAIT_PROXY_TIMEOUT:-10}
+deadline=$((SECONDS + timeout_s))
+while :; do
+  if timeout 1 bash -c 'exec 3<>/dev/tcp/localhost/1055' 2>/dev/null; then
+    exit 0
+  fi
+  if ((SECONDS >= deadline)); then
+    echo "wait-proxy: tailscaled's proxy on localhost:1055 is not accepting connections after ${timeout_s}s." \
+      "Tailnet and other proxied requests will fail until it starts." \
+      "Check: supervisorctl -c /etc/supervisor/supervisord.conf status tailscaled" >&2
+    exit 0
+  fi
+  sleep 0.5
+done
