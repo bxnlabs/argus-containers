@@ -18,7 +18,8 @@ ENV PATH=${ARGUS_TOOLS}/bin:${PATH}
 # The agent CLIs run the version baked into the image. See README, "Agent CLI
 # versions". codex reads its switch from /etc/codex/config.toml (rootfs).
 ENV DISABLE_AUTOUPDATER=1
-ENV AGY_CLI_DISABLE_AUTO_UPDATE=1
+# agy accepts only "true" here; with "1" its updater still runs.
+ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 RUN mkdir -p ${ARGUS_TOOLS}/bin ${ARGUS_TOOLS}/lib ${ARGUS_TOOLS}/share
 
@@ -126,7 +127,7 @@ RUN set -eux; \
     esac; \
     mkdir -p "${ARGUS_TOOLS}/lib/node"; \
     curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${N_ARCH}.tar.gz" \
-        | tar -xz --strip-components=1 -C "${ARGUS_TOOLS}/lib/node"; \
+        | tar -xz --strip-components=1 --no-same-owner -C "${ARGUS_TOOLS}/lib/node"; \
     for b in node npm npx; do \
         ln -s "${ARGUS_TOOLS}/lib/node/bin/${b}" "${ARGUS_TOOLS}/bin/${b}"; \
     done

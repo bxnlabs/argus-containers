@@ -62,6 +62,8 @@ check_cli_readonly() {
       for p in /opt/argus/bin /opt/argus/lib/node_modules /opt/argus/bin/agy /opt/argus/bin/omp; do
         if [ -w "$p" ]; then echo "$p is writable"; exit 1; fi
       done
+      owned=$(find /opt/argus/lib/node ! -uid 0 | head -n 1)
+      if [ -n "$owned" ]; then echo "$owned is not owned by root"; exit 1; fi
       grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml || { echo "codex config missing"; exit 1; }' 2>&1); then
     pass "agent CLIs are read-only to a non-root user; codex update check is off"
   else
@@ -72,7 +74,7 @@ check_cli_readonly() {
 check_update_env() {
   local env
   env=$(docker image inspect --format '{{json .Config.Env}}' "$image")
-  if [[ $env == *'"DISABLE_AUTOUPDATER=1"'* && $env == *'"AGY_CLI_DISABLE_AUTO_UPDATE=1"'* ]]; then
+  if [[ $env == *'"DISABLE_AUTOUPDATER=1"'* && $env == *'"AGY_CLI_DISABLE_AUTO_UPDATE=true"'* ]]; then
     pass "claude and agy auto-updates are disabled in the image ENV"
   else
     fail "auto-update switches missing from image ENV: $env"
