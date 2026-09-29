@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Print the Dockerfile ARG lines for the current Antigravity CLI (agy)
+# release. agy has no Renovate datasource, so bumps are manual: paste the
+# output over the AGY_* ARGs in the Dockerfile.
+set -euo pipefail
+
+updater=https://antigravity-cli-auto-updater-974169037036.us-central1.run.app
+amd64=$(curl -fsSL --max-time 15 "$updater/manifests/linux_amd64.json")
+arm64=$(curl -fsSL --max-time 15 "$updater/manifests/linux_arm64.json")
+
+# The Dockerfile builds these URLs as
+# .../antigravity-cli/<version>-<build>/{linux-x64/cli_linux_x64,linux-arm/cli_linux_arm64}.tar.gz
+re_amd64='/antigravity-cli/([0-9.]+)-([0-9]+)/linux-x64/cli_linux_x64\.tar\.gz$'
+re_arm64='/antigravity-cli/([0-9.]+)-([0-9]+)/linux-arm/cli_linux_arm64\.tar\.gz$'
+url_amd64=$(jq -r .url <<<"$amd64")
+url_arm64=$(jq -r .url <<<"$arm64")
+[[ $url_amd64 =~ $re_amd64 ]] || { echo "unexpected amd64 URL layout: $url_amd64 (update the Dockerfile's agy RUN)" >&2; exit 1; }
+version=${BASH_REMATCH[1]} build=${BASH_REMATCH[2]}
+[[ $url_arm64 =~ $re_arm64 ]] || { echo "unexpected arm64 URL layout: $url_arm64 (update the Dockerfile's agy RUN)" >&2; exit 1; }
+[[ ${BASH_REMATCH[1]} == "$version" && ${BASH_REMATCH[2]} == "$build" ]] ||
+  { echo "amd64 and arm64 manifests disagree: $url_amd64 vs $url_arm64" >&2; exit 1; }
+[[ $(jq -r .version <<<"$amd64") == "$version" ]] || { echo "manifest version does not match its URL" >&2; exit 1; }
+
+echo "ARG AGY_VERSION=$version"
+echo "ARG AGY_BUILD=$build"
+echo "ARG AGY_SHA512_AMD64=$(jq -r .sha512 <<<"$amd64")"
+echo "ARG AGY_SHA512_ARM64=$(jq -r .sha512 <<<"$arm64")"

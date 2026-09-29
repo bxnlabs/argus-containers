@@ -105,6 +105,7 @@ check_supervisord() {
     -v "$work/home:/home/smoke" -v "$work/ts:/var/lib/tailscale" \
     "$image" /usr/bin/supervisord -c /etc/supervisor/supervisord.conf)
 
+  # shellcheck disable=SC2016 # $HOME must expand in the container, not here.
   if retry 30 docker exec "$cid" sh -c 'test -f "$HOME/.zshrc" && test -L "$HOME/.oh-my-zsh"'; then
     pass "home-bootstrap seeded an empty HOME"
   else

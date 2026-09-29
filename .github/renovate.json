@@ -1,0 +1,44 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "mergeConfidence:all-badges",
+    "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Pin Dockerfile base images by digest",
+      "matchDatasources": ["docker"],
+      "pinDigests": true
+    },
+    {
+      "description": "GitHub release tags have a v prefix; the Dockerfile ARGs do not",
+      "matchDatasources": ["github-releases"],
+      "extractVersion": "^v(?<version>.+)$"
+    },
+    {
+      "description": "Stay on the Node.js major the image ships; move majors by hand",
+      "matchDatasources": ["node-version"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update _VERSION variables in Dockerfiles",
+      "managerFilePatterns": ["/(^|/|\\.)Dockerfile$/", "/(^|/)Dockerfile\\.[^/]*$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z.-]+?)(?: packageName=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[a-z-]+?))?\\s(?:ARG) (?<depName>[^\\s]+?)_VERSION=(?<currentValue>.+)\\s"
+      ]
+    }
+  ],
+  "customDatasources": {
+    "gcloud": {
+      "description": "Google Cloud CLI: the rapid channel's current version",
+      "defaultRegistryUrlTemplate": "https://dl.google.com/dl/cloudsdk/channels/rapid/components-2.json",
+      "format": "json",
+      "transformTemplates": ["{\"releases\": [{\"version\": version}]}"]
+    }
+  },
+  "automerge": true
+}
