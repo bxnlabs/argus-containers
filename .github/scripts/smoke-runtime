@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Runtime smoke checks for the profile image. CI runs them on linux/amd64
+# before it pushes. No tailnet login is involved.
+# Usage: smoke-runtime IMAGE
+set -uo pipefail
+
+image=${1:?usage: smoke-runtime IMAGE}
+failures=0
+
+pass() { echo "PASS $*"; }
+fail() {
+  echo "FAIL $*"
+  failures=$((failures + 1))
+}
+
+# retry N CMD...: run CMD once a second until it succeeds, at most N times.
+retry() {
+  local n=$1 i
+  shift
+  for ((i = 0; i < n; i++)); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# The image stops before the identity layer: each profile adds its own user.
+check_identity() {
+  local user env rc
+  if ! user=$(docker image inspect --format '{{.Config.User}}' "$image") ||
+    ! env=$(docker image inspect --format '{{json .Config.Env}}' "$image"); then
+    fail "cannot inspect $image"
+    return
+  fi
+  if [[ -z $user ]]; then pass "default user is root"; else fail "image sets USER=$user"; fi
+  if [[ $env != *'"HOME='* ]]; then pass "HOME is not set"; else fail "image sets HOME: $env"; fi
+  # getent exits 2 when the key is not found; any other status is a failure.
+  docker run --rm "$image" getent passwd argus >/dev/null
+  rc=$?
+  case $rc in
+    2) pass "no argus user" ;;
+    0) fail "image has an argus user" ;;
+    *) fail "getent passwd argus exited $rc" ;;
+  esac
+}
+
+check_runtime_dirs() {
+  local modes
+  modes=$(docker run --rm "$image" stat -c '%a %n' /var/run/tailscale /opt/argus/share/supervisor)
+  if [[ $modes == $'1777 /var/run/tailscale\n1777 /opt/argus/share/supervisor' ]]; then
+    pass "runtime directories are 1777"
+  else
+    fail "runtime directory modes: $modes"
+  fi
+}
+
+checks=(check_identity check_runtime_dirs)
+for c in "${checks[@]}"; do "$c"; done
+
+if ((failures)); then
+  echo "$failures runtime check(s) failed"
+  exit 1
+fi
+echo "all runtime checks passed"
