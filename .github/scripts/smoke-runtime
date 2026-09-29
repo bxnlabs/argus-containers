@@ -64,10 +64,23 @@ check_cli_readonly() {
       done
       owned=$(find /opt/argus/lib/node ! -uid 0 | head -n 1)
       if [ -n "$owned" ]; then echo "$owned is not owned by root"; exit 1; fi
+      # Nothing under /opt/argus is group- or other-writable except the
+      # supervisor runtime directory, which is 1777.
+      loose=$(find /opt/argus -perm /022 ! -type l ! -path /opt/argus/share/supervisor | head -n 5)
+      if [ -n "$loose" ]; then echo "group- or other-writable: $loose"; exit 1; fi
       grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml || { echo "codex config missing"; exit 1; }' 2>&1); then
     pass "agent CLIs are read-only to a non-root user; codex update check is off"
   else
     fail "agent CLI install is not locked down: $out"
+  fi
+  # A process in group 0 cannot replace the pinned CLIs either.
+  if out=$(docker run --rm --user 12345:0 "$image" sh -c '
+      for p in /opt/argus /opt/argus/bin /opt/argus/share /opt/argus/bin/claude /opt/argus/bin/agy; do
+        if [ -w "$p" ]; then echo "$p is writable"; exit 1; fi
+      done' 2>&1); then
+    pass "/opt/argus is read-only to a non-root user in group 0"
+  else
+    fail "/opt/argus is writable by group 0: $out"
   fi
 }
 

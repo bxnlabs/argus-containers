@@ -177,9 +177,14 @@ FROM base AS profile
 COPY --from=k8s /usr/bin/kubectl /usr/bin/helm ${ARGUS_TOOLS}/bin/
 COPY --from=deps ${ARGUS_TOOLS}/ ${ARGUS_TOOLS}/
 
+# Nothing under the tool prefix is writable by anyone but root, whatever
+# modes rootfs/ was checked out with, so no profile user (even one in group 0)
+# can replace a pinned CLI. Only the entries that need it are touched, which
+# keeps this layer small.
 # Runtime directories for whatever non-root UID a profile adds, sticky and
 # world-writable so no profile needs its own chown. Profiles bind-mount
 # /var/lib/tailscale, which hides this directory and its mode.
 RUN set -eux; \
+    find "${ARGUS_TOOLS}" -perm /022 ! -type l -exec chmod go-w {} +; \
     mkdir -p /var/run/tailscale /var/lib/tailscale "${ARGUS_TOOLS}/share/supervisor"; \
     chmod 1777 /var/run/tailscale "${ARGUS_TOOLS}/share/supervisor"
