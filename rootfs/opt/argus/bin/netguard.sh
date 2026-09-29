@@ -18,6 +18,8 @@
 set -euo pipefail
 
 raw=${NETGUARD_TAILNET_PREFIXES:-100.64.0.0/10}
+# read stops at the first newline, so fold a multi-line value onto one line.
+raw=${raw//$'\n'/ }
 read -r -a prefixes <<<"${raw//,/ }"
 if ((${#prefixes[@]} == 0)); then
   echo "netguard: NETGUARD_TAILNET_PREFIXES is empty" >&2

@@ -164,12 +164,13 @@ check_env_sh() {
 }
 
 # netguard in the configuration a profile runs it in: root, only NET_ADMIN,
-# IPv6 disabled by sysctl.
+# IPv6 disabled by sysctl. The prefixes span two lines, as a YAML block
+# scalar in compose.yaml would pass them.
 check_netguard() {
   local cid out
   cid=$(docker run -d --user root --cap-drop ALL --cap-add NET_ADMIN \
     --sysctl net.ipv6.conf.all.disable_ipv6=1 \
-    -e NETGUARD_TAILNET_PREFIXES='100.64.0.0/10, 192.168.77.0/24' \
+    -e NETGUARD_TAILNET_PREFIXES=$'100.64.0.0/10,\n192.168.77.0/24' \
     --entrypoint /opt/argus/bin/netguard.sh "$image")
   if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
     pass "netguard healthcheck passes"
