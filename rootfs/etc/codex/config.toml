@@ -1,0 +1,3 @@
+# System-wide Codex defaults for the Argus profile image. The image pins the
+# Codex version, so skip the update check at startup.
+check_for_update_on_startup = false

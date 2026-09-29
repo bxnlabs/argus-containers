@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Run each CLI's version command in the image. A tool pinned in the Dockerfile
+# must report its pinned version.
+# Usage: smoke-versions IMAGE PLATFORM
+set -uo pipefail
+
+image=${1:?usage: smoke-versions IMAGE PLATFORM}
+platform=${2:?usage: smoke-versions IMAGE PLATFORM}
+dockerfile=${DOCKERFILE:-$(cd "$(dirname "$0")/../.." && pwd)/Dockerfile}
+failures=0
+
+# expected PIN: print the pinned version named by PIN. PIN is an ARG name, or
+# FROM:alpine/k8s for the tag kubectl comes from.
+expected() {
+  case $1 in
+    FROM:alpine/k8s) sed -n 's|^FROM alpine/k8s:\([^@ ]*\).*|\1|p' "$dockerfile" ;;
+    *) sed -n "s/^ARG $1=//p" "$dockerfile" ;;
+  esac
+}
+
+# check NAME PIN CMD...: run CMD in the image. PIN is "-" for a tool with no
+# pinned version; otherwise the output must contain the pinned version.
+check() {
+  local name=$1 pin=$2 want="" out
+  shift 2
+  if [[ $pin != - ]]; then
+    want=$(expected "$pin")
+    if [[ -z $want ]]; then
+      echo "FAIL $name: no pinned version for $pin in $dockerfile"
+      failures=$((failures + 1))
+      return
+    fi
+  fi
+  if ! out=$(docker run --rm --platform "$platform" "$image" "$@" 2>&1); then
+    echo "FAIL $name: '$*' exited nonzero:"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
+    return
+  fi
+  if [[ -n $want ]] && ! grep -Eq "(^|[^0-9.])${want//./\\.}([^0-9.]|$)" <<<"$out"; then
+    echo "FAIL $name: expected version $want, got:"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
+    return
+  fi
+  echo "PASS $name: $(head -n1 <<<"$out")"
+}
+
+check tailscale   TAILSCALE_VERSION tailscale version
+check tailscaled  TAILSCALE_VERSION tailscaled --version
+check pulumi      PULUMI_VERSION    pulumi version
+check gcloud      GCLOUD_VERSION    gcloud version
+check gsutil      -                 gsutil version
+check bq          -                 bq version
+check kubectl     FROM:alpine/k8s   kubectl version --client
+check helm        -                 helm version --short
+check supervisord -                 supervisord --version
+check zsh         -                 zsh --version
+check node        NODE_VERSION        node --version
+check npm         -                   npm --version
+check claude      CLAUDE_CODE_VERSION claude --version
+check codex       CODEX_VERSION       codex --version
+check agy         AGY_VERSION         agy --version
+check omp         OMP_VERSION         omp --version
+
+if ((failures)); then
+  echo "$failures version check(s) failed on $platform"
+  exit 1
+fi
+echo "all version checks passed on $platform"
