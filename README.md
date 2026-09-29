@@ -170,7 +170,7 @@ gh api /orgs/bxnlabs/packages/container/argus-containers%2Fprofile/versions \
 
 The list also holds each image's per-platform and attestation manifests. Pin only a digest for which `docker buildx imagetools inspect ghcr.io/bxnlabs/argus-containers/profile:main@sha256:<digest>` lists both `linux/amd64` and `linux/arm64`.
 
-To keep a record instead, note the digest right after each `argus profile up`. It is the image that update built on, unless CI pushed a new one in between:
+To keep a record instead, note the digest right after each `argus profile up` on an unpinned `FROM`. It is the image that update built on, unless CI pushed a new one in between. (A pinned profile's digest is the one in its `FROM`.)
 
 ```sh
 docker buildx imagetools inspect ghcr.io/bxnlabs/argus-containers/profile:main --format '{{.Manifest.Digest}}'
