@@ -163,7 +163,65 @@ check_env_sh() {
   fi
 }
 
-checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_wait_proxy_timeout check_env_sh)
+# netguard in the configuration a profile runs it in: root, only NET_ADMIN,
+# IPv6 disabled by sysctl.
+check_netguard() {
+  local cid out
+  cid=$(docker run -d --user root --cap-drop ALL --cap-add NET_ADMIN \
+    --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    -e NETGUARD_TAILNET_PREFIXES='100.64.0.0/10, 192.168.77.0/24' \
+    --entrypoint /opt/argus/bin/netguard.sh "$image")
+  if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    pass "netguard healthcheck passes"
+  else
+    fail "netguard healthcheck never passed"
+    docker logs "$cid"
+  fi
+  out=$(docker exec "$cid" ip -4 route show type unreachable)
+  if [[ $out == *"unreachable 100.64.0.0/10"* && $out == *"unreachable 192.168.77.0/24"* ]]; then
+    pass "netguard routes every prefix to unreachable"
+  else
+    fail "netguard routes: $out"
+  fi
+  # iproute2 reports the unreachable route as EHOSTUNREACH, which prints
+  # "No route to host" or "Host is unreachable" depending on the version.
+  if out=$(docker exec "$cid" ip route get 100.79.1.1 2>&1); then
+    fail "ip route get found a route: $out"
+  elif [[ $out == *unreachable* || $out == *"No route to host"* ]]; then
+    pass "tailnet address is unreachable"
+  else
+    fail "ip route get: $out"
+  fi
+  docker rm -f "$cid" >/dev/null
+}
+
+# expect_netguard_exit DESC DOCKER_RUN_ARGS...: netguard must exit nonzero,
+# not sit running without a guard.
+expect_netguard_exit() {
+  local desc=$1 name=netguard-smoke-$RANDOM rc
+  shift
+  timeout 30 docker run --name "$name" "$@" --entrypoint /opt/argus/bin/netguard.sh "$image" >/dev/null 2>&1
+  rc=$?
+  docker rm -f "$name" >/dev/null 2>&1
+  # 124 is the timeout; 125-127 are docker failing to run netguard at all.
+  if ((rc != 0 && rc != 124 && (rc < 125 || rc > 127))); then
+    pass "netguard exits nonzero $desc"
+  else
+    fail "netguard did not exit nonzero $desc (rc=$rc)"
+  fi
+}
+
+check_netguard_fails_loudly() {
+  expect_netguard_exit "without NET_ADMIN" \
+    --user root --cap-drop ALL --sysctl net.ipv6.conf.all.disable_ipv6=1
+  expect_netguard_exit "with IPv6 enabled" \
+    --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0
+  expect_netguard_exit "with a malformed prefix" \
+    --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    -e NETGUARD_TAILNET_PREFIXES=100.64.1.0/10
+}
+
+checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_wait_proxy_timeout check_env_sh check_netguard check_netguard_fails_loudly)
 for c in "${checks[@]}"; do "$c"; done
 
 if ((failures)); then
