@@ -56,6 +56,12 @@ check kubectl     FROM:alpine/k8s   kubectl version --client
 check helm        -                 helm version --short
 check supervisord -                 supervisord --version
 check zsh         -                 zsh --version
+check node        NODE_VERSION        node --version
+check npm         -                   npm --version
+check claude      CLAUDE_CODE_VERSION claude --version
+check codex       CODEX_VERSION       codex --version
+check agy         AGY_VERSION         agy --version
+check omp         OMP_VERSION         omp --version
 
 if ((failures)); then
   echo "$failures version check(s) failed on $platform"

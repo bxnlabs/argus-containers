@@ -54,7 +54,32 @@ check_runtime_dirs() {
   fi
 }
 
-checks=(check_identity check_runtime_dirs)
+# The agent CLIs must not be able to replace themselves: the image's version
+# is the one that runs.
+check_cli_readonly() {
+  local out
+  if out=$(docker run --rm --user 12345:12345 "$image" sh -c '
+      for p in /opt/argus/bin /opt/argus/lib/node_modules /opt/argus/bin/agy /opt/argus/bin/omp; do
+        if [ -w "$p" ]; then echo "$p is writable"; exit 1; fi
+      done
+      grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml || { echo "codex config missing"; exit 1; }' 2>&1); then
+    pass "agent CLIs are read-only to a non-root user; codex update check is off"
+  else
+    fail "agent CLI install is not locked down: $out"
+  fi
+}
+
+check_update_env() {
+  local env
+  env=$(docker image inspect --format '{{json .Config.Env}}' "$image")
+  if [[ $env == *'"DISABLE_AUTOUPDATER=1"'* && $env == *'"AGY_CLI_DISABLE_AUTO_UPDATE=1"'* ]]; then
+    pass "claude and agy auto-updates are disabled in the image ENV"
+  else
+    fail "auto-update switches missing from image ENV: $env"
+  fi
+}
+
+checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env)
 for c in "${checks[@]}"; do "$c"; done
 
 if ((failures)); then

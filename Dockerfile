@@ -15,6 +15,11 @@ ENV DEBCONF_NONINTERACTIVE_SEEN=true
 ENV ARGUS_TOOLS=/opt/argus
 ENV PATH=${ARGUS_TOOLS}/bin:${PATH}
 
+# The agent CLIs run the version baked into the image. See README, "Agent CLI
+# versions". codex reads its switch from /etc/codex/config.toml (rootfs).
+ENV DISABLE_AUTOUPDATER=1
+ENV AGY_CLI_DISABLE_AUTO_UPDATE=1
+
 RUN mkdir -p ${ARGUS_TOOLS}/bin ${ARGUS_TOOLS}/lib ${ARGUS_TOOLS}/share
 
 # Base development tools. No iptables: userspace Tailscale doesn't touch
@@ -59,6 +64,20 @@ ARG TAILSCALE_VERSION=1.102.4
 ARG PULUMI_VERSION=3.265.0
 # renovate: datasource=custom.gcloud packageName=google-cloud-cli
 ARG GCLOUD_VERSION=586.0.0
+# renovate: datasource=node-version packageName=node
+ARG NODE_VERSION=24.21.0
+# renovate: datasource=npm packageName=@anthropic-ai/claude-code
+ARG CLAUDE_CODE_VERSION=2.1.284
+# renovate: datasource=npm packageName=@openai/codex
+ARG CODEX_VERSION=0.158.0
+# renovate: datasource=github-releases packageName=can1357/oh-my-pi
+ARG OMP_VERSION=18.4.2
+# Antigravity CLI (agy) has no Renovate datasource. Bump these by hand from the
+# output of .github/scripts/agy-latest.
+ARG AGY_VERSION=1.2.13
+ARG AGY_BUILD=6662628811079680
+ARG AGY_SHA512_AMD64=7a10134a69c575dc11bdc721322344e9db3bf2c9d890f2d40ff0bffda93d39b6ef1c7c486f491d1ddf08b123deef375c7bbe46b62cd3fbc3cc956b1a3bd22956
+ARG AGY_SHA512_ARM64=a26463715b58b787ef24d377138351b725e980c3dec417faa60ad991c8e676f67c6c83b7158d2ef95569a87ba79d0ef2eb781b6d53ac2dbf991f5443f7a46573
 
 # Tailscale (static binaries: tailscale + tailscaled)
 RUN set -eux; \
@@ -97,6 +116,56 @@ RUN set -eux; \
 
 # oh-my-zsh (cloned to a system path; $HOME is seeded from it at container start)
 RUN git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "${ARGUS_TOOLS}/share/oh-my-zsh"
+
+# Node.js, the runtime for the npm-distributed agent CLIs.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) N_ARCH=x64 ;; \
+        arm64) N_ARCH=arm64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p "${ARGUS_TOOLS}/lib/node"; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${N_ARCH}.tar.gz" \
+        | tar -xz --strip-components=1 -C "${ARGUS_TOOLS}/lib/node"; \
+    for b in node npm npx; do \
+        ln -s "${ARGUS_TOOLS}/lib/node/bin/${b}" "${ARGUS_TOOLS}/bin/${b}"; \
+    done
+
+# claude and codex, installed as root under the tool prefix so the profile
+# user cannot replace them.
+RUN set -eux; \
+    npm install --global --prefix "${ARGUS_TOOLS}" --no-fund --no-audit \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@openai/codex@${CODEX_VERSION}"; \
+    npm cache clean --force
+
+# omp (oh-my-pi), checked against the release's SHA256SUMS.txt.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) O_ARCH=x64 ;; \
+        arm64) O_ARCH=arm64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}"; \
+    cd /tmp; \
+    curl -fsSLO "${base}/omp-linux-${O_ARCH}"; \
+    curl -fsSL "${base}/SHA256SUMS.txt" | grep "  omp-linux-${O_ARCH}\$" | sha256sum -c -; \
+    install -m 0755 "omp-linux-${O_ARCH}" "${ARGUS_TOOLS}/bin/omp"; \
+    rm -f "omp-linux-${O_ARCH}"
+
+# agy (Antigravity CLI), checked against the pinned SHA-512.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) A_PATH=linux-x64/cli_linux_x64.tar.gz; A_SHA="$AGY_SHA512_AMD64" ;; \
+        arm64) A_PATH=linux-arm/cli_linux_arm64.tar.gz; A_SHA="$AGY_SHA512_ARM64" ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/agy.tar.gz \
+        "https://storage.googleapis.com/antigravity-public/antigravity-cli/${AGY_VERSION}-${AGY_BUILD}/${A_PATH}"; \
+    echo "${A_SHA}  /tmp/agy.tar.gz" | sha512sum -c -; \
+    tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
+    install -m 0755 /tmp/antigravity "${ARGUS_TOOLS}/bin/agy"; \
+    rm -f /tmp/agy.tar.gz /tmp/antigravity
 
 ############################
 # profile: the published image. No user and no HOME: a profile adds its own
