@@ -34,6 +34,7 @@ check_identity() {
   fi
   if [[ -z $user ]]; then pass "default user is root"; else fail "image sets USER=$user"; fi
   if [[ $env != *'"HOME='* ]]; then pass "HOME is not set"; else fail "image sets HOME: $env"; fi
+  if [[ $env == *'"SHELL=/bin/zsh"'* ]]; then pass "SHELL is zsh"; else fail "SHELL is not /bin/zsh: $env"; fi
   # getent exits 2 when the key is not found; any other status is a failure.
   docker run --rm "$image" getent passwd argus >/dev/null
   rc=$?

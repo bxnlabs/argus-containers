@@ -14,6 +14,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBCONF_NONINTERACTIVE_SEEN=true
 ENV ARGUS_TOOLS=/opt/argus
 ENV PATH=${ARGUS_TOOLS}/bin:${PATH}
+# Argus shell sessions exec "${SHELL:-/bin/bash}" -l, and docker exec does not
+# read the passwd entry, so this is what makes them zsh login shells.
+ENV SHELL=/bin/zsh
 
 # The agent CLIs run the version baked into the image. See README, "Agent CLI
 # versions". codex reads its switch from /etc/codex/config.toml (rootfs).

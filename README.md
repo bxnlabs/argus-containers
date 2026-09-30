@@ -12,7 +12,7 @@ A base image with everything a dockerized Argus profile needs:
 - A supervisord configuration that seeds `$HOME` and runs tailscaled. tailscaled serves an HTTP and SOCKS5 proxy on `localhost:1055`.
 - `/opt/argus/bin/netguard.sh`, `/opt/argus/bin/wait-proxy` and `/opt/argus/etc/env.sh`, described below.
 
-Tools live under `/opt/argus`, which is on `PATH` for every process in the container.
+Tools live under `/opt/argus`, which is on `PATH` for every process in the container. The image sets `SHELL=/bin/zsh`, so Argus shell sessions start a zsh login shell.
 
 The image has **no user**. It runs as root and does not set `HOME`. Argus runs a profile's agent as the host's uid and gid, which a published image cannot know, so each profile adds its own user.
 
@@ -229,3 +229,42 @@ Renovate keeps the image current and automerges once CI passes. CI builds both a
 | apt packages, oh-my-zsh | Not pinned: apt packages come from the pinned Ubuntu base's archive at build time; oh-my-zsh is cloned from its default branch |
 
 When Argus supports a new agent CLI, add it to the image and to `.github/scripts/smoke-versions`.
+
+## Tailnet-separation e2e
+
+`e2e/tailnet-separation.sh` proves, through Argus, that a dockerized profile's container joins a tailnet that is not the host's and that the two stay separate. It enrolls a throwaway target node and the profile's agent in a dedicated test tailnet, runs its checks inside a real Argus shell session, and cleans up after itself.
+
+### Prerequisites (once)
+
+1. Create a new tailnet for this test, separate from the host's. Keep MagicDNS enabled (the default).
+2. In its access control policy, add:
+
+   ```json
+   {
+     "tagOwners": { "tag:argus-e2e": ["autogroup:admin"] },
+     "grants": [
+       { "src": ["tag:argus-e2e"], "dst": ["tag:argus-e2e"], "ip": ["*"] }
+     ]
+   }
+   ```
+
+3. Create an OAuth client with the scopes `auth_keys` (write) and `devices:core` (read and write), restricted to `tag:argus-e2e`.
+4. Write `~/.config/argus-e2e/<profile>.env` with mode `0600`:
+
+   ```sh
+   TS_E2E_OAUTH_CLIENT_ID=…
+   TS_E2E_OAUTH_CLIENT_SECRET=…
+   TS_E2E_TAILNET=…          # the test tailnet's name, as `tailscale status --json` reports .CurrentTailnet.Name
+   ```
+
+The profile must follow the recipe above: a `netguard` service, a hook that sources `env.sh` and runs `export ARGUS_E2E_POST_CREATE=in-container-sentinel` (A7 checks for this exact value), and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
+
+### Running it
+
+```sh
+e2e/tailnet-separation.sh --profile acme-test
+```
+
+Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `ip`, `python3` (for a probe listener on the host's tailnet IP), `git`, and a host `tailscale` CLI connected to the host's tailnet.
+
+The script prints one `PASS` or `FAIL` line per assertion (A1–A7). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (subnet routes, or an exit node). Concurrent runs are not supported. Teardown reports its own failures but does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
