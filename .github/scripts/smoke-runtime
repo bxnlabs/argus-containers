@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runtime smoke checks for the profile image. CI runs them on linux/amd64
+# Runtime smoke checks for the profile image. CI runs them on each platform
 # before it pushes. No tailnet login is involved.
 # Usage: smoke-runtime IMAGE
 set -uo pipefail
