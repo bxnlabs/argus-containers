@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
 # kubectl and helm come straight from the upstream k8s image.
 FROM alpine/k8s:1.34.3@sha256:f7dbea27672a55bc2b7dd17cdec2d7a03664a7abef9852cbb8be845d9e70c308 AS k8s
@@ -71,11 +71,11 @@ ARG GCLOUD_VERSION=586.0.0
 # renovate: datasource=node-version packageName=node
 ARG NODE_VERSION=24.21.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
-ARG CLAUDE_CODE_VERSION=2.1.284
+ARG CLAUDE_CODE_VERSION=2.1.285
 # renovate: datasource=npm packageName=@openai/codex
 ARG CODEX_VERSION=0.158.0
 # renovate: datasource=github-releases packageName=can1357/oh-my-pi
-ARG OMP_VERSION=18.4.2
+ARG OMP_VERSION=18.4.4
 # Antigravity CLI (agy) has no Renovate datasource. Bump these by hand from the
 # output of .github/scripts/agy-latest.
 ARG AGY_VERSION=1.2.13
