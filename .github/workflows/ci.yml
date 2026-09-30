@@ -106,3 +106,18 @@ jobs:
           docker buildx imagetools create --tag "$IMAGE:main" "${refs[@]}"
         env:
           IMAGE: ghcr.io/${{ github.repository }}/profile
+
+  # The default ruleset in bxnlabs/infra requires this check by name, so
+  # renaming the job breaks merges. Add jobs to needs to make them required.
+  ci-ok:
+    needs: [lint, image]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require every needed job to succeed
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
+        env:
+          NEEDS: ${{ toJSON(needs) }}
