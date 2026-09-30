@@ -153,6 +153,17 @@ argus profile up <name>
 
 This rebuilds the profile on the latest `:main` (`build.pull: true` re-pulls the base) and recreates the containers when the image changed. **That ends every live session in the profile.** Argus does not refuse when sessions are live, so stop them first. A lazy session start never rebuilds, so nothing changes until you run this command.
 
+An update that changes only the image's configuration, such as an `ENV` line, adds no new layers. Docker's default builder can then reuse a stale copy of the base image's configuration from its build cache, and the profile keeps the old settings. If an update doesn't seem to apply, rebuild once without the cache, then update as usual:
+
+```sh
+cd ~/.argus/profiles/<name>
+ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$HOME/.argus ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
+  docker compose -p argus-<name> build --pull --no-cache
+argus profile up <name>
+```
+
+To check what the agent got, compare `docker image inspect argus-<name>-agent --format '{{json .Config.Env}}'` with the published image's environment.
+
 ## Rolling back
 
 Pin the profile's `FROM` to the digest of an earlier image, then run `argus profile up <name>`:
