@@ -229,3 +229,42 @@ Renovate keeps the image current and automerges once CI passes. CI builds both a
 | apt packages, oh-my-zsh | Not pinned: apt packages come from the pinned Ubuntu base's archive at build time; oh-my-zsh is cloned from its default branch |
 
 When Argus supports a new agent CLI, add it to the image and to `.github/scripts/smoke-versions`.
+
+## Tailnet-separation e2e
+
+`e2e/tailnet-separation.sh` proves, through Argus, that a dockerized profile's container joins a tailnet that is not the host's and that the two stay separate. It enrolls a throwaway target node and the profile's agent in a dedicated test tailnet, runs its checks inside a real Argus shell session, and cleans up after itself.
+
+### Prerequisites (once)
+
+1. Create a new tailnet for this test, separate from the host's. Keep MagicDNS enabled (the default).
+2. In its access control policy, add:
+
+   ```json
+   {
+     "tagOwners": { "tag:argus-e2e": ["autogroup:admin"] },
+     "grants": [
+       { "src": ["tag:argus-e2e"], "dst": ["tag:argus-e2e"], "ip": ["*"] }
+     ]
+   }
+   ```
+
+3. Create an OAuth client with the scopes `auth_keys` (write) and `devices:core` (read and write), restricted to `tag:argus-e2e`.
+4. Write `~/.config/argus-e2e/<profile>.env` with mode `0600`:
+
+   ```sh
+   TS_E2E_OAUTH_CLIENT_ID=…
+   TS_E2E_OAUTH_CLIENT_SECRET=…
+   TS_E2E_TAILNET=…          # the test tailnet's name, as `tailscale status --json` reports .CurrentTailnet.Name
+   ```
+
+The profile must follow the recipe above: a `netguard` service, a hook that sources `env.sh` and exports `ARGUS_E2E_POST_CREATE`, and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
+
+### Running it
+
+```sh
+e2e/tailnet-separation.sh --profile acme-test
+```
+
+Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `ss`, `git`, and a host `tailscale` CLI connected to the host's tailnet. If nothing listens on the host's tailnet IP, `python3` is also needed to start a probe listener.
+
+The script prints one `PASS` or `FAIL` line per assertion (A1–A7). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (subnet routes, or an exit node). Concurrent runs are not supported.
