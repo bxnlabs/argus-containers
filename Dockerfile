@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
 # kubectl and helm come straight from the upstream k8s image.
 FROM alpine/k8s:1.34.3@sha256:f7dbea27672a55bc2b7dd17cdec2d7a03664a7abef9852cbb8be845d9e70c308 AS k8s
