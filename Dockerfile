@@ -68,6 +68,12 @@ ARG TAILSCALE_VERSION=1.102.4
 ARG PULUMI_VERSION=3.265.0
 # renovate: datasource=custom.gcloud packageName=google-cloud-cli
 ARG GCLOUD_VERSION=586.0.0
+# renovate: datasource=github-tags packageName=aws/aws-cli
+ARG AWSCLI_VERSION=2.37.6
+# renovate: datasource=pypi packageName=azure-cli
+ARG AZURE_CLI_VERSION=2.90.0
+# renovate: datasource=github-releases packageName=derailed/k9s
+ARG K9S_VERSION=0.51.0
 # renovate: datasource=node-version packageName=node
 ARG NODE_VERSION=24.21.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
@@ -117,6 +123,43 @@ RUN set -eux; \
     for b in gcloud gsutil bq; do \
         ln -s "${ARGUS_TOOLS}/lib/google-cloud-sdk/bin/${b}" "${ARGUS_TOOLS}/bin/${b}"; \
     done
+
+# AWS CLI v2
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) AWS_ARCH=x86_64 ;; \
+        arm64) AWS_ARCH=aarch64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    cd /tmp; \
+    curl -fsSLo awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}-${AWSCLI_VERSION}.zip"; \
+    unzip -q awscliv2.zip; \
+    ./aws/install --install-dir "${ARGUS_TOOLS}/lib/aws-cli" --bin-dir "${ARGUS_TOOLS}/bin"; \
+    rm -rf awscliv2.zip aws
+
+# Azure CLI, in its own Python environment on the system python3. The venv
+# module is only needed to create it, so it stays out of the published image.
+RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    set -eux; \
+    apt-get update && apt-get install --no-install-recommends --yes python3-venv; \
+    python3 -m venv "${ARGUS_TOOLS}/lib/azure-cli"; \
+    "${ARGUS_TOOLS}/lib/azure-cli/bin/pip" install --no-cache-dir "azure-cli==${AZURE_CLI_VERSION}"; \
+    ln -s "${ARGUS_TOOLS}/lib/azure-cli/bin/az" "${ARGUS_TOOLS}/bin/az"
+
+# k9s, checked against the release's checksums.sha256.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) K_ARCH=amd64 ;; \
+        arm64) K_ARCH=arm64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}"; \
+    cd /tmp; \
+    curl -fsSLO "${base}/k9s_Linux_${K_ARCH}.tar.gz"; \
+    curl -fsSL "${base}/checksums.sha256" | grep "  k9s_Linux_${K_ARCH}.tar.gz\$" | sha256sum -c -; \
+    tar -xzf "k9s_Linux_${K_ARCH}.tar.gz" -C "${ARGUS_TOOLS}/bin" k9s; \
+    rm -f "k9s_Linux_${K_ARCH}.tar.gz"
 
 # oh-my-zsh (cloned to a system path; $HOME is seeded from it at container start)
 RUN git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "${ARGUS_TOOLS}/share/oh-my-zsh"
