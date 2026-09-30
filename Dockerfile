@@ -68,7 +68,7 @@ ARG GCLOUD_VERSION=586.0.0
 # renovate: datasource=node-version packageName=node
 ARG NODE_VERSION=24.21.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
-ARG CLAUDE_CODE_VERSION=2.1.284
+ARG CLAUDE_CODE_VERSION=2.1.285
 # renovate: datasource=npm packageName=@openai/codex
 ARG CODEX_VERSION=0.158.0
 # renovate: datasource=github-releases packageName=can1357/oh-my-pi
