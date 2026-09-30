@@ -14,7 +14,7 @@ A base image with everything a dockerized Argus profile needs:
 
 Tools live under `/opt/argus`, which is on `PATH` for every process in the container. The image sets `SHELL=/bin/zsh`, so Argus shell sessions start a zsh login shell.
 
-The image has **no user**. It runs as root and does not set `HOME`. Argus runs a profile's agent as the host's uid and gid, which a published image cannot know, so each profile adds its own user.
+The image has **no user**. It runs as root and does not set `HOME`. Argus runs a profile's agent as the host's user, which a published image cannot know, so each profile adds its own.
 
 `:main` is the only tag. CI pushes it for `linux/amd64` and `linux/arm64` on every merge to `main`, after smoke-testing both architectures.
 
@@ -37,19 +37,24 @@ hooks/post_create.sh
 # syntax=docker/dockerfile:1
 FROM ghcr.io/bxnlabs/argus-containers/profile:main
 
-# Host-matching identity. Free the uid/gid first (ubuntu ships uid/gid 1000 as
-# the `ubuntu` user). HOME points at the mounted host home (-M: reference the
+# Host-matching identity: the host's uid, gid, user name and group name. Free
+# each first (ubuntu ships uid/gid 1000 as the `ubuntu` user, and a `staff`
+# group with gid 50). HOME points at the mounted host home (-M: reference the
 # mount, don't create it).
 ARG ARGUS_UID
 ARG ARGUS_GID
+ARG ARGUS_USER
+ARG ARGUS_GROUP
 ARG ARGUS_HOST_HOME
 RUN set -eux; \
     if u=$(getent passwd "$ARGUS_UID" | cut -d: -f1); [ -n "$u" ]; then userdel "$u"; fi; \
     if g=$(getent group  "$ARGUS_GID" | cut -d: -f1); [ -n "$g" ]; then groupdel "$g"; fi; \
-    groupadd -g "$ARGUS_GID" argus; \
-    useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /usr/bin/zsh argus
+    if getent passwd "$ARGUS_USER"  >/dev/null; then userdel  "$ARGUS_USER";  fi; \
+    if getent group  "$ARGUS_GROUP" >/dev/null; then groupdel "$ARGUS_GROUP"; fi; \
+    groupadd -g "$ARGUS_GID" "$ARGUS_GROUP"; \
+    useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /usr/bin/zsh "$ARGUS_USER"
 ENV HOME=$ARGUS_HOST_HOME
-USER argus
+USER $ARGUS_USER
 ```
 
 ### compose.yaml
@@ -61,12 +66,14 @@ x-profile-build: &profile-build
   args:
     ARGUS_UID: ${ARGUS_UID}
     ARGUS_GID: ${ARGUS_GID}
+    ARGUS_USER: ${ARGUS_USER:-argus}     # unset on older Argus, or when the lookup fails
+    ARGUS_GROUP: ${ARGUS_GROUP:-argus}
     ARGUS_HOST_HOME: ${ARGUS_HOST_HOME}
 
 services:
   netguard:
     build: *profile-build
-    hostname: my-profile          # the agent shares this container's hostname
+    hostname: ${ARGUS_HOSTNAME:-my-profile}   # the host's; the agent shares this container's hostname
     user: root
     entrypoint: ["/opt/argus/bin/netguard.sh"]
     environment:
@@ -101,7 +108,9 @@ The service Argus runs sessions in must be named `agent`. `netguard` uses the sa
 
 Referencing the shared tag directly would be a problem: any pull of it (another profile's refresh, a manual `docker pull`) would make the next lazy start recreate `netguard`, and with it the agent and its live sessions.
 
-`hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network.
+Argus passes `ARGUS_HOST_HOME`, `ARGUS_STATE_DIR`, `ARGUS_UID` and `ARGUS_GID` to every compose invocation. It also passes `ARGUS_USER` (the host login name), `ARGUS_GROUP` (the name of the host user's primary group) and `ARGUS_HOSTNAME` (the host's short hostname), so the agent runs as the host's user on a container named like the host. Those three are best-effort: Argus leaves one unset when its lookup fails, and Argus releases before bxnlabs/argus#197 pass none of them, which is what the recipe's defaults are for.
+
+`hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network. It is also the name `tailscale up` registers the container under; pass `--hostname` to register a different one.
 
 ### hooks/post_create.sh
 
@@ -158,6 +167,7 @@ An update that changes only the image's configuration, such as an `ENV` line, ad
 ```sh
 cd ~/.argus/profiles/<name>
 ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$HOME/.argus ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
+  ARGUS_USER=$(id -un) ARGUS_GROUP=$(id -gn) ARGUS_HOSTNAME=$(hostname -s) \
   docker compose -p argus-<name> build --pull --no-cache
 argus profile up <name>
 ```
