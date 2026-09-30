@@ -7,7 +7,7 @@ Container images for [Argus](https://github.com/bxnlabs/argus) dockerized profil
 A base image with everything a dockerized Argus profile needs:
 
 - Ubuntu 26.04 with a development tool set (build-essential, git, jq, python3, tmux, vim, zsh and more).
-- tailscale and tailscaled (userspace networking), pulumi, gcloud (with gsutil and bq), kubectl, helm and oh-my-zsh.
+- tailscale and tailscaled (userspace networking), pulumi, gcloud (with gsutil and bq), aws, az, kubectl, helm, k9s and oh-my-zsh.
 - The agent CLIs Argus supports: `claude`, `codex`, `agy` (Antigravity) and `omp` (oh-my-pi), plus Node.js for the npm-distributed ones.
 - A supervisord configuration that seeds `$HOME` and runs tailscaled. tailscaled serves an HTTP and SOCKS5 proxy on `localhost:1055`.
 - `/opt/argus/bin/netguard.sh`, `/opt/argus/bin/wait-proxy` and `/opt/argus/etc/env.sh`, described below.
@@ -241,7 +241,9 @@ Renovate keeps the image current and automerges once CI passes. CI builds both a
 | Dependency | How it is updated |
 |---|---|
 | `ubuntu`, `alpine/k8s` (kubectl, helm) | Renovate, digest-pinned |
-| tailscale, pulumi, omp | Renovate, GitHub releases |
+| tailscale, pulumi, k9s, omp | Renovate, GitHub releases |
+| aws | Renovate, GitHub tags |
+| az | Renovate, PyPI |
 | claude, codex | Renovate, npm |
 | Node.js | Renovate within the current major; move majors by hand |
 | gcloud | Renovate, through a custom datasource over Google's rapid-channel `components-2.json` |
