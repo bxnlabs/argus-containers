@@ -332,7 +332,6 @@ preflight_checks() {
   HOST_TS_IP=$(jq -r '[.Self.TailscaleIPs[]? | select(test("^[0-9.]+$"))][0] // empty' <<<"$HOST_STATUS")
   HOST_DNS=$(jq -r '(.Self.DNSName // "") | rtrimstr(".")' <<<"$HOST_STATUS")
   HOST_DNS_SUFFIX=$(jq -r '.CurrentTailnet.MagicDNSSuffix // .MagicDNSSuffix // empty' <<<"$HOST_STATUS")
-  # shellcheck disable=SC2034 # used by later phases
   HOST_IPS_JSON=$(jq -c '[.Self.TailscaleIPs[]?, .Peer[]?.TailscaleIPs[]?]' <<<"$HOST_STATUS")
   [[ -n $HOST_TS_IP && -n $HOST_DNS && -n $HOST_DNS_SUFFIX ]] || die "cannot read the host's tailnet IP or MagicDNS name"
   log "host tailnet $HOST_TAILNET: $HOST_DNS ($HOST_TS_IP)"
@@ -541,6 +540,12 @@ start_agent() {
   wait_shell_ready zsh || { log "the session shell never answered after switching to zsh"; return 1; }
   # shellcheck disable=SC2016 # expands in the session's shell
   agent_exec 'test -n "$ZSH_VERSION"' || { log "the session shell is not zsh: $AGENT_OUT"; return 1; }
+  # oh-my-zsh's url-quote-magic (run on pasted text by bracketed-paste-magic)
+  # escapes characters that follow a URL, so `curl http://h/; rc=$?` reaches
+  # the shell as `curl http://h/\; rc=$?`. Restore zsh's builtin widgets so
+  # every command runs exactly as sent.
+  agent_exec 'zle -A .self-insert self-insert && zle -A .bracketed-paste bracketed-paste' ||
+    { log "restoring zsh's builtin line-editor widgets failed: $AGENT_OUT"; return 1; }
   wait_until "$DEADLINE" daemon_needs_login ||
     { log "tailscaled in the session never reported NeedsLogin: $AGENT_OUT"; return 1; }
 
@@ -554,6 +559,127 @@ start_agent() {
   rm -f -- "$AGENT_KEY"
   ((rc == 0)) || { log "tailscale up failed (rc=$rc): $AGENT_OUT"; return 1; }
   wait_until "$DEADLINE" agent_logged_in || { log "the agent never came up as $AGENT_HOST: $AGENT_OUT"; return 1; }
+}
+
+ASSERT_FAILED=0
+CHECK_OUT=""
+
+# assert ID DESCRIPTION CMD...: run one assertion and print its verdict.
+assert() {
+  local id=$1 desc=$2
+  shift 2
+  CHECK_OUT=""
+  if "$@"; then
+    printf 'PASS %s %s\n' "$id" "$desc"
+  else
+    ASSERT_FAILED=1
+    printf 'FAIL %s %s\n' "$id" "$desc"
+    [[ -n $CHECK_OUT ]] && printf '%s\n' "$CHECK_OUT" | sed 's/^/    /'
+  fi
+}
+
+# in_agent LABEL CMD: one step of an assertion, run in the session. On failure
+# its label, status and output go into CHECK_OUT.
+in_agent() {
+  local rc
+  agent_exec "$2"
+  rc=$?
+  if ((rc != 0)); then
+    CHECK_OUT+="$1 (rc=$rc):"$'\n'"$AGENT_OUT"$'\n'
+    return 1
+  fi
+}
+
+# on_host LABEL CMD...: one step of an assertion, run on the host.
+on_host() {
+  local label=$1 out rc
+  shift
+  out=$("$@" 2>&1)
+  rc=$?
+  if ((rc != 0)); then
+    CHECK_OUT+="$label (rc=$rc):"$'\n'"$out"$'\n'
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2016 # these commands expand in the session's shell
+a1_joined_test_tailnet() {
+  in_agent "tailnet name" "$(tmpl 'n=$(tailscale status --json | jq -r ".CurrentTailnet.Name // empty"); printf "tailnet=%s\n" "$n"; [ "$n" = @WANT@ ] && [ "$n" != @HOST@ ]' \
+    WANT "$(q "$TS_E2E_TAILNET")" HOST "$(q "$HOST_TAILNET")")"
+}
+
+a2_peer_ping() {
+  # --until-direct defaults to true, which fails a working DERP-relayed path.
+  in_agent "tailscale ping $TARGET" "timeout 40 tailscale ping --until-direct=false -c 3 --timeout 10s $TARGET"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the session's shell
+a3_proxy_http() {
+  in_agent "curl http://$TARGET:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the session's shell
+a4_no_host_tailnet() {
+  local failed=0
+  local py='import errno, socket, sys; s = socket.socket(); s.settimeout(5); r = s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(errno.errorcode.get(r, r)); sys.exit(0 if r in (errno.EHOSTUNREACH, errno.ENETUNREACH) else 1)'
+
+  # Positive controls from the host, immediately before: the targets are there.
+  on_host "control: host connects to $HOST_TS_IP:$PROBE_PORT" timeout 5 bash -c "exec 3<>/dev/tcp/$HOST_TS_IP/$PROBE_PORT" || failed=1
+  if [[ -n $PEER_IP ]]; then
+    on_host "control: host pings $PEER_IP" timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$PEER_IP" || failed=1
+  fi
+
+  # Through Tailscale.
+  in_agent "no host-tailnet peers in tailscale status" "$(tmpl 'tailscale status --json | jq -e --argjson bad @BAD@ --arg sfx @SFX@ "[.Peer[]? | select(any(.TailscaleIPs[]?; . as \$i | any(\$bad[]; . == \$i)) or ((.DNSName // \"\") | endswith(\$sfx)))] | length == 0" >/dev/null || { tailscale status --json | jq -r ".Peer[]? | .DNSName"; false; }' \
+    BAD "$(q "$HOST_IPS_JSON")" SFX "$(q ".$HOST_DNS_SUFFIX.")")" || failed=1
+  in_agent "tailscale ping $HOST_TS_IP fails" "if timeout 20 tailscale ping -c 1 --timeout 5s $HOST_TS_IP; then echo unexpected-pong; false; else true; fi" || failed=1
+  in_agent "curl http://$HOST_DNS/ fails" "$(tmpl 'curl -f -sS -o /dev/null --max-time 5 http://@D@/; rc=$?; printf "curl_rc=%s\n" "$rc"; [ "$rc" -ne 0 ]' D "$HOST_DNS")" || failed=1
+
+  # Direct path: no proxy, the kernel route must refuse with EHOSTUNREACH or
+  # ENETUNREACH (not a timeout or a refusal).
+  in_agent "direct connect to $HOST_TS_IP:$PROBE_PORT is unreachable" "python3 -c $(q "$py") $HOST_TS_IP $PROBE_PORT" || failed=1
+  if [[ -n $PEER_IP ]]; then
+    in_agent "direct connect to $PEER_IP:$PROBE_PORT is unreachable" "python3 -c $(q "$py") $PEER_IP $PROBE_PORT" || failed=1
+  fi
+  in_agent "ip route get $HOST_TS_IP is unreachable" "$(tmpl 'out=$(ip route get @IP@ 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qiE "unreachable|no route to host"' IP "$HOST_TS_IP")" || failed=1
+  return "$failed"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the session's shell
+a5_internet_egress() {
+  in_agent "https://api.tailscale.com/ answers" 'code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 https://api.tailscale.com/); printf "http=%s\n" "$code"; [ -n "$code" ] && [ "$code" != 000 ]'
+}
+
+check_host_status() {
+  local st
+  st=$(timeout "$API_DEADLINE" tailscale status --json) || return 1
+  jq -e --arg tn "$HOST_TAILNET" \
+    '.CurrentTailnet.Name == $tn and ([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-"))] | length == 0)' \
+    <<<"$st" >/dev/null && return 0
+  jq -r '"tailnet=\(.CurrentTailnet.Name) e2e_peers=\([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-")) | .HostName])"' <<<"$st"
+  return 1
+}
+
+a6_host_unaffected() {
+  on_host "host tailscale status" check_host_status
+}
+
+# shellcheck disable=SC2016 # these commands expand in the session's shell
+a7_env_from_hook() {
+  # /proc/$$/environ is the environment the shell started with, before it read
+  # .zshrc.
+  in_agent "session shell's initial environment" 'e=$(tr "\0" "\n" < /proc/$$/environ); n=$(printf "%s\n" "$e" | grep -cixE "(all|http|https)_proxy=http://localhost:1055"); printf "proxy_vars=%s\n" "$n"; [ "$n" -eq 6 ] && printf "%s\n" "$e" | grep -qx "ARGUS_E2E_POST_CREATE=in-container-sentinel"' || return 1
+  in_agent "curl from zsh -f" "$(tmpl 'r=$(zsh -f -c "curl -fsS --max-time 15 http://@T@:8080/"); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
+}
+
+run_assertions() {
+  assert A1 "joined the other tailnet" a1_joined_test_tailnet
+  assert A2 "peer connectivity" a2_peer_ping
+  assert A3 "proxy, MagicDNS and a real service" a3_proxy_http
+  assert A4 "the container cannot reach the host tailnet by any path" a4_no_host_tailnet
+  assert A5 "internet egress still works through the proxy" a5_internet_egress
+  assert A6 "the host is unaffected" a6_host_unaffected
+  assert A7 "the proxy comes from the post_create hook, not .zshrc" a7_env_from_hook
 }
 
 # td NAME CMD...: run one teardown step. Report a failure and carry on.
@@ -599,7 +725,8 @@ main() {
   choose_probe
   start_target || die "the target node did not come up"
   start_agent || die "the agent did not join the test tailnet"
-  die "assertions not implemented yet (agent is on the test tailnet)"
+  run_assertions
+  ((ASSERT_FAILED == 0))
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
