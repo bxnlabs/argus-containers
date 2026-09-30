@@ -112,7 +112,8 @@ RUN set -eux; \
     curl -fsSL "https://get.pulumi.com/releases/sdk/pulumi-v${PULUMI_VERSION}-linux-${P_ARCH}.tar.gz" \
         | tar -xz --strip-components=1 -C "${ARGUS_TOOLS}/bin"
 
-# Google Cloud SDK (gcloud, gsutil, bq)
+# Google Cloud SDK (gcloud, gsutil, bq), plus gke-gcloud-auth-plugin for
+# kubectl against GKE. The component comes from the pinned SDK's snapshot.
 RUN set -eux; \
     case "$TARGETARCH" in \
         amd64) G_ARCH=x86_64 ;; \
@@ -121,7 +122,10 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${GCLOUD_VERSION}-linux-${G_ARCH}.tar.gz" \
         | tar -xz -C "${ARGUS_TOOLS}/lib"; \
-    for b in gcloud gsutil bq; do \
+    CLOUDSDK_CONFIG=/tmp/gcloud "${ARGUS_TOOLS}/lib/google-cloud-sdk/bin/gcloud" \
+        components install gke-gcloud-auth-plugin --quiet; \
+    rm -rf /tmp/gcloud "${ARGUS_TOOLS}/lib/google-cloud-sdk/.install/.backup"; \
+    for b in gcloud gsutil bq gke-gcloud-auth-plugin; do \
         ln -s "${ARGUS_TOOLS}/lib/google-cloud-sdk/bin/${b}" "${ARGUS_TOOLS}/bin/${b}"; \
     done
 
