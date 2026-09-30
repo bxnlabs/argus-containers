@@ -184,6 +184,11 @@ tmpl() {
 
 q() { printf '%q' "$1"; }
 
+# is_run_name NAME: whether NAME is a session or repo name this script
+# generates (argus-e2e- and an 8-hex-digit run ID). recover deletes only
+# these, never other sessions that merely share the prefix.
+is_run_name() { [[ $1 =~ ^argus-e2e-[0-9a-f]{8}$ ]]; }
+
 parse_args() {
   PROFILE=
   while (($#)); do
@@ -231,8 +236,6 @@ compose() {
   ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$STATE_DIR ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
     timeout "$STEP_TIMEOUT" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
 }
-
-stack_running() { compose ps --status running --services 2>/dev/null | grep -qx agent; }
 
 # guard_prefixes: the profile's NETGUARD_TAILNET_PREFIXES (netguard.sh's
 # default when unset). Fails when the profile has no netguard service.
@@ -308,8 +311,8 @@ logout_owned_login() {
 }
 
 preflight_checks() {
-  local c st uncovered
-  for c in argus docker curl jq timeout tailscale ss git od; do
+  local c st uncovered services
+  for c in argus docker curl jq timeout tailscale ip python3 git od; do
     command -v "$c" >/dev/null || die "missing host command: $c"
   done
   [[ -f $CRED_FILE ]] || die "missing $CRED_FILE (README: Tailnet-separation e2e)"
@@ -337,11 +340,13 @@ preflight_checks() {
   log "host tailnet $HOST_TAILNET: $HOST_DNS ($HOST_TS_IP)"
 
   GUARD_PREFIXES=$(guard_prefixes) || die "cannot read NETGUARD_TAILNET_PREFIXES from $COMPOSE_FILE (is there a netguard service?)"
-  uncovered=$(ip -4 route show table 52 2>/dev/null | uncovered_routes "$GUARD_PREFIXES")
+  uncovered=$(ip -4 route show table 52 | uncovered_routes "$GUARD_PREFIXES") ||
+    die "cannot inspect the host's Tailscale routes (ip route table 52)"
   [[ -z $uncovered ]] ||
     die "host Tailscale routes not covered by NETGUARD_TAILNET_PREFIXES=$GUARD_PREFIXES: $(tr '\n' ' ' <<<"$uncovered")"
 
-  if stack_running; then
+  services=$(compose ps --status running --services) || die "cannot read the profile's stack state"
+  if grep -qx agent <<<"$services"; then
     STACK_WAS_UP=1
     st=$(compose exec -T agent tailscale status --json 2>/dev/null)
     case $(classify_login "$st" "$TS_E2E_TAILNET") in
@@ -361,21 +366,24 @@ preflight_checks() {
 
 # recover: clean up after earlier crashed runs.
 recover() {
-  local ids id names n
+  local sessions id name dir names n
   if ((ABANDONED_LOGIN)); then
     log "logging out a login left by an earlier e2e run"
     OWN_LOGIN=1
     logout_owned_login || die "could not log out the abandoned e2e login"
   fi
-  ids=$(timeout "$STEP_TIMEOUT" argus session ls --json | jq -r '.sessions[] | select(.name | startswith("argus-e2e-")) | .id') ||
+  sessions=$(timeout "$STEP_TIMEOUT" argus session ls --json | jq -r '.sessions[] | [.id, .name] | @tsv') ||
     die "listing Argus sessions failed"
-  for id in $ids; do
-    log "deleting leftover session $id"
+  while IFS=$'\t' read -r id name; do
+    is_run_name "$name" || continue
+    log "deleting leftover session $name ($id)"
     timeout "$STEP_TIMEOUT" argus session rm "$id" --force --delete-branch >/dev/null 2>&1 ||
       timeout "$STEP_TIMEOUT" argus session rm "$id" --force >/dev/null ||
       die "could not delete leftover session $id"
+  done <<<"$sessions"
+  for dir in "$STATE_DIR"/tmp/argus-e2e-*; do
+    if is_run_name "${dir##*/}"; then rm -rf -- "$dir"; fi
   done
-  rm -rf -- "$STATE_DIR"/tmp/argus-e2e-*
   names=$(timeout "$STEP_TIMEOUT" docker ps -a --filter 'name=^argus-e2e-target-' --format '{{.Names}}') ||
     die "listing containers failed"
   for n in $names; do
@@ -385,9 +393,11 @@ recover() {
   delete_e2e_devices || die "sweeping leftover argus-e2e devices failed"
 }
 
+# start_probe_listener: listen on the host's tailnet IP and answer every
+# connection with an HTTP response carrying NONCE, so a probe that reaches it
+# is recognizable whatever the path.
 start_probe_listener() {
   local portfile
-  command -v python3 >/dev/null || return 1
   portfile=$(mktemp) || return 1
   timeout 900 python3 -c '
 import socket, sys
@@ -396,8 +406,17 @@ s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((sys.argv[1], 0))
 s.listen(8)
 print(s.getsockname()[1], flush=True)
+body = sys.argv[2].encode()
+resp = b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
 while True:
-    s.accept()[0].close()' "$HOST_TS_IP" >"$portfile" 2>/dev/null &
+    c = s.accept()[0]
+    try:
+        c.settimeout(5)
+        c.recv(4096)
+        c.sendall(resp)
+    except OSError:
+        pass
+    c.close()' "$HOST_TS_IP" "$NONCE" >"$portfile" 2>/dev/null &
   PROBE_PID=$!
   wait_until 10 test -s "$portfile"
   PROBE_PORT=$(head -n1 "$portfile")
@@ -405,17 +424,11 @@ while True:
   [[ -n $PROBE_PORT ]]
 }
 
-# choose_probe: a TCP port the host listens on at its tailnet IP (starting a
-# throwaway listener if there is none), and one host-tailnet peer that answers
-# tailscale ping, if any.
+# choose_probe: start the probe listener on the host's tailnet IP, and pick
+# one host-tailnet peer that answers tailscale ping, if any.
 choose_probe() {
   local ip
-  PROBE_PORT=$(ss -ltnH | awk -v ip="$HOST_TS_IP" '{
-      addr = $4; port = addr; sub(/.*:/, "", port); host = addr; sub(/:[^:]*$/, "", host)
-      if (host == "0.0.0.0" || host == "*" || host == ip) { print port; exit } }')
-  if [[ -z $PROBE_PORT ]]; then
-    start_probe_listener || die "nothing listens on $HOST_TS_IP and starting a probe listener failed (needs python3)"
-  fi
+  start_probe_listener || die "starting the probe listener on $HOST_TS_IP failed"
   log "A4 probe: $HOST_TS_IP:$PROBE_PORT"
   for ip in $(jq -r '.Peer[]? | select(.Online) | .TailscaleIPs[]? | select(test("^[0-9.]+$"))' <<<"$HOST_STATUS" | head -n 3); do
     if timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$ip" >/dev/null 2>&1; then
@@ -489,17 +502,17 @@ agent_exec() {
   return 124
 }
 
-# wait_shell_ready PHASE: type a harmless marker command every 5 seconds until
-# one shows up in the pane, which proves the shell is reading input.
+# wait_shell_ready: type a harmless marker command every 5 seconds until one
+# shows up in the pane, which proves the shell is reading input.
 wait_shell_ready() {
-  local phase=$1 n=0 end=$((SECONDS + DEADLINE)) i
+  local n=0 end=$((SECONDS + DEADLINE)) i
   while ((SECONDS < end)); do
     n=$((n + 1))
-    timeout "$STEP_TIMEOUT" argus session send "$SESSION" "printf '%s:%s\n' ARGUS-E2E READY-$phase-$RUN_ID-$n" --enter >/dev/null 2>&1
+    timeout "$STEP_TIMEOUT" argus session send "$SESSION" "printf '%s:%s\n' ARGUS-E2E READY-$RUN_ID-$n" --enter >/dev/null 2>&1
     for i in 1 2 3 4 5; do
       sleep 1
       if timeout "$STEP_TIMEOUT" argus session peek "$SESSION" --all 2>/dev/null | strip_ctrl |
-        grep -q "^ARGUS-E2E:READY-$phase-$RUN_ID-"; then
+        grep -q "^ARGUS-E2E:READY-$RUN_ID-"; then
         return 0
       fi
     done
@@ -530,14 +543,8 @@ start_agent() {
   timeout 600 argus session new "$SESSION" --provider shell --profile "$PROFILE" --src "$REPO_DIR" --branch "$SESSION" >/dev/null ||
     { log "argus session new failed"; return 1; }
 
-  # Argus shell sessions exec "${SHELL:-/bin/bash}" -l, and docker exec does not
-  # set SHELL, so the login shell is bash. The assertions run in interactive
-  # zsh. exec keeps the environment the hook set up.
-  wait_shell_ready login || { log "the session shell never answered"; return 1; }
-  # shellcheck disable=SC2016 # expands in the session's shell
-  timeout "$STEP_TIMEOUT" argus session send "$SESSION" '[ -n "$ZSH_VERSION" ] || exec zsh -i' --enter >/dev/null ||
-    { log "sending the zsh switch failed"; return 1; }
-  wait_shell_ready zsh || { log "the session shell never answered after switching to zsh"; return 1; }
+  wait_shell_ready || { log "the session shell never answered"; return 1; }
+  # The image's SHELL makes the session a zsh login shell.
   # shellcheck disable=SC2016 # expands in the session's shell
   agent_exec 'test -n "$ZSH_VERSION"' || { log "the session shell is not zsh: $AGENT_OUT"; return 1; }
   # oh-my-zsh's url-quote-magic (run on pasted text by bracketed-paste-magic)
@@ -618,13 +625,17 @@ a3_proxy_http() {
   in_agent "curl http://$TARGET:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
 }
 
+host_gets_nonce() {
+  [[ $(curl -sS --noproxy '*' --max-time 5 "http://$HOST_TS_IP:$PROBE_PORT/") == "$NONCE" ]]
+}
+
 # shellcheck disable=SC2016 # these commands expand in the session's shell
 a4_no_host_tailnet() {
   local failed=0
   local py='import errno, socket, sys; s = socket.socket(); s.settimeout(5); r = s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(errno.errorcode.get(r, r)); sys.exit(0 if r in (errno.EHOSTUNREACH, errno.ENETUNREACH) else 1)'
 
   # Positive controls from the host, immediately before: the targets are there.
-  on_host "control: host connects to $HOST_TS_IP:$PROBE_PORT" timeout 5 bash -c "exec 3<>/dev/tcp/$HOST_TS_IP/$PROBE_PORT" || failed=1
+  on_host "control: host gets the nonce from $HOST_TS_IP:$PROBE_PORT" host_gets_nonce || failed=1
   if [[ -n $PEER_IP ]]; then
     on_host "control: host pings $PEER_IP" timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$PEER_IP" || failed=1
   fi
@@ -633,7 +644,7 @@ a4_no_host_tailnet() {
   in_agent "no host-tailnet peers in tailscale status" "$(tmpl 'tailscale status --json | jq -e --argjson bad @BAD@ --arg sfx @SFX@ "[.Peer[]? | select(any(.TailscaleIPs[]?; . as \$i | any(\$bad[]; . == \$i)) or ((.DNSName // \"\") | endswith(\$sfx)))] | length == 0" >/dev/null || { tailscale status --json | jq -r ".Peer[]? | .DNSName"; false; }' \
     BAD "$(q "$HOST_IPS_JSON")" SFX "$(q ".$HOST_DNS_SUFFIX.")")" || failed=1
   in_agent "tailscale ping $HOST_TS_IP fails" "if timeout 20 tailscale ping -c 1 --timeout 5s $HOST_TS_IP; then echo unexpected-pong; false; else true; fi" || failed=1
-  in_agent "curl http://$HOST_DNS/ fails" "$(tmpl 'curl -f -sS -o /dev/null --max-time 5 http://@D@/; rc=$?; printf "curl_rc=%s\n" "$rc"; [ "$rc" -ne 0 ]' D "$HOST_DNS")" || failed=1
+  in_agent "curl http://$HOST_DNS:$PROBE_PORT/ does not reach the host" "$(tmpl 'r=$(curl -sS --max-time 5 http://@D@:@P@/); printf "rc=%s got=%s\n" "$?" "$r"; [ "$r" != @N@ ]' D "$HOST_DNS" P "$PROBE_PORT" N "$NONCE")" || failed=1
 
   # Direct path: no proxy, the kernel route must refuse with EHOSTUNREACH or
   # ENETUNREACH (not a timeout or a refusal).
@@ -641,6 +652,8 @@ a4_no_host_tailnet() {
   if [[ -n $PEER_IP ]]; then
     in_agent "direct connect to $PEER_IP:$PROBE_PORT is unreachable" "python3 -c $(q "$py") $PEER_IP $PROBE_PORT" || failed=1
   fi
+  # Every interface, not just conf/all: a per-interface setting can differ.
+  in_agent "IPv6 is disabled on every interface" 'if grep -qx 0 /proc/sys/net/ipv6/conf/*/disable_ipv6; then grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6; false; fi' || failed=1
   in_agent "ip route get $HOST_TS_IP is unreachable" "$(tmpl 'out=$(ip route get @IP@ 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qiE "unreachable|no route to host"' IP "$HOST_TS_IP")" || failed=1
   return "$failed"
 }
@@ -654,9 +667,9 @@ check_host_status() {
   local st
   st=$(timeout "$API_DEADLINE" tailscale status --json) || return 1
   jq -e --arg tn "$HOST_TAILNET" \
-    '.CurrentTailnet.Name == $tn and ([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-"))] | length == 0)' \
+    '.BackendState == "Running" and .CurrentTailnet.Name == $tn and ([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-"))] | length == 0)' \
     <<<"$st" >/dev/null && return 0
-  jq -r '"tailnet=\(.CurrentTailnet.Name) e2e_peers=\([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-")) | .HostName])"' <<<"$st"
+  jq -r '"state=\(.BackendState) tailnet=\(.CurrentTailnet.Name) e2e_peers=\([.Peer[]? | select((.HostName // "") | startswith("argus-e2e-")) | .HostName])"' <<<"$st"
   return 1
 }
 
@@ -666,8 +679,8 @@ a6_host_unaffected() {
 
 # shellcheck disable=SC2016 # these commands expand in the session's shell
 a7_env_from_hook() {
-  # /proc/$$/environ is the environment the shell started with, before it read
-  # .zshrc.
+  # /proc/$$/environ is the environment Argus started the login shell with,
+  # after the hook and before .zshrc.
   in_agent "session shell's initial environment" 'e=$(tr "\0" "\n" < /proc/$$/environ); n=$(printf "%s\n" "$e" | grep -cixE "(all|http|https)_proxy=http://localhost:1055"); printf "proxy_vars=%s\n" "$n"; [ "$n" -eq 6 ] && printf "%s\n" "$e" | grep -qx "ARGUS_E2E_POST_CREATE=in-container-sentinel"' || return 1
   in_agent "curl from zsh -f" "$(tmpl 'r=$(zsh -f -c "curl -fsS --max-time 15 http://@T@:8080/"); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
 }
@@ -701,8 +714,10 @@ teardown() {
   log "teardown"
   ((SESSION_CREATED)) && td "delete session $SESSION" timeout "$STEP_TIMEOUT" argus session rm "$SESSION" --force --delete-branch
   ((OWN_LOGIN)) && td "log out the e2e login" logout_owned_login
-  [[ -n $TOKEN ]] && td "delete argus-e2e devices" delete_e2e_devices
+  # Remove the target before listing devices, so an enrollment still pending
+  # cannot complete after the sweep.
   ((TARGET_STARTED)) && td "remove $TARGET" timeout "$STEP_TIMEOUT" docker rm -f "$TARGET"
+  [[ -n $TOKEN ]] && td "delete argus-e2e devices" delete_e2e_devices
   [[ -n $PROBE_PID ]] && td "stop the probe listener" kill "$PROBE_PID"
   ((REPO_CREATED)) && td "delete $REPO_DIR" rm -rf -- "$REPO_DIR"
   [[ -n $KEY_DIR ]] && td "delete the target key" rm -rf -- "$KEY_DIR"

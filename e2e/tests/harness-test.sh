@@ -37,6 +37,13 @@ touch "$tmp/docker-compose.yml" "$tmp/compose.yml"
 eq "compose order" "$tmp/compose.yml" "$(find_compose_file "$tmp")"
 rm -rf "$tmp"
 
+# is_run_name matches only generated names, not other argus-e2e-* sessions.
+ok is_run_name argus-e2e-79a901f3
+nok is_run_name argus-e2e-tailnet-separation
+nok is_run_name argus-e2e-79a901f
+nok is_run_name argus-e2e-target-79a901f3
+nok is_run_name xargus-e2e-79a901f3
+
 # cidr_covers
 ok cidr_covers 100.64.0.0/10 100.65.124.11
 ok cidr_covers 100.64.0.0/10 100.100.100.100

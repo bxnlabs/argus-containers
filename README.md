@@ -12,7 +12,7 @@ A base image with everything a dockerized Argus profile needs:
 - A supervisord configuration that seeds `$HOME` and runs tailscaled. tailscaled serves an HTTP and SOCKS5 proxy on `localhost:1055`.
 - `/opt/argus/bin/netguard.sh`, `/opt/argus/bin/wait-proxy` and `/opt/argus/etc/env.sh`, described below.
 
-Tools live under `/opt/argus`, which is on `PATH` for every process in the container.
+Tools live under `/opt/argus`, which is on `PATH` for every process in the container. The image sets `SHELL=/bin/zsh`, so Argus shell sessions start a zsh login shell.
 
 The image has **no user**. It runs as root and does not set `HOME`. Argus runs a profile's agent as the host's uid and gid, which a published image cannot know, so each profile adds its own user.
 
@@ -257,7 +257,7 @@ When Argus supports a new agent CLI, add it to the image and to `.github/scripts
    TS_E2E_TAILNET=…          # the test tailnet's name, as `tailscale status --json` reports .CurrentTailnet.Name
    ```
 
-The profile must follow the recipe above: a `netguard` service, a hook that sources `env.sh` and exports `ARGUS_E2E_POST_CREATE`, and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
+The profile must follow the recipe above: a `netguard` service, a hook that sources `env.sh` and runs `export ARGUS_E2E_POST_CREATE=in-container-sentinel` (A7 checks for this exact value), and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
 
 ### Running it
 
@@ -265,6 +265,6 @@ The profile must follow the recipe above: a `netguard` service, a hook that sour
 e2e/tailnet-separation.sh --profile acme-test
 ```
 
-Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `ss`, `git`, and a host `tailscale` CLI connected to the host's tailnet. If nothing listens on the host's tailnet IP, `python3` is also needed to start a probe listener.
+Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `ip`, `python3` (for a probe listener on the host's tailnet IP), `git`, and a host `tailscale` CLI connected to the host's tailnet.
 
-The script prints one `PASS` or `FAIL` line per assertion (A1–A7). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (subnet routes, or an exit node). Concurrent runs are not supported.
+The script prints one `PASS` or `FAIL` line per assertion (A1–A7). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (subnet routes, or an exit node). Concurrent runs are not supported. Teardown reports its own failures but does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
