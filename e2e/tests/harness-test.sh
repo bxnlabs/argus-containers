@@ -75,6 +75,14 @@ printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$profiles" >"$tmp/s"
 eq "state: live login" logged-in "$(state_file_login "$tmp/s")"
 printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$(printf '{}' | base64 -w0)" >"$tmp/s"
 eq "state: dangling pointer" logged-out "$(state_file_login "$tmp/s")"
+# tailscaled's real shape: _current-profile holds the profile's state key
+# ("profile-<ID>"), which is the Key field of its _profiles entry.
+cur=$(printf 'profile-646f' | base64 -w0)
+profiles=$(printf '{"646f":{"ID":"646f","Key":"profile-646f","Name":"x"}}' | base64 -w0)
+printf '{"_current-profile":"%s","_machinekey":"x","_profiles":"%s","profile-646f":"x"}' "$cur" "$profiles" >"$tmp/s"
+eq "state: live login, real shape" logged-in "$(state_file_login "$tmp/s")"
+printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$(printf '{"77aa":{"ID":"77aa","Key":"profile-77aa"}}' | base64 -w0)" >"$tmp/s"
+eq "state: dangling pointer, real shape" logged-out "$(state_file_login "$tmp/s")"
 printf 'garbage' >"$tmp/s"
 nok state_file_login "$tmp/s"
 printf '{"_current-profile":"%s","_profiles":"@@@"}' "$cur" >"$tmp/s"

@@ -137,7 +137,9 @@ state_file_login() {
     return 0
   fi
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$profiles" || return 1
-  if jq -e --arg id "$cur" 'has($id)' >/dev/null <<<"$profiles"; then
+  # tailscaled stores the profile's state key (its Key field, "profile-<ID>")
+  # in _current-profile. A bare ID is accepted too.
+  if jq -e --arg k "$cur" 'has($k) or any(.[]; .Key? == $k)' >/dev/null <<<"$profiles"; then
     echo logged-in
   else
     echo logged-out
@@ -215,7 +217,6 @@ init_run() {
   export RUN_ID NONCE
   SESSION=argus-e2e-$RUN_ID
   TARGET=argus-e2e-target-$RUN_ID
-  # shellcheck disable=SC2034 # used by later phases
   AGENT_HOST=argus-e2e-agent-$RUN_ID
   REPO_DIR=$STATE_DIR/tmp/argus-e2e-$RUN_ID
   AGENT_KEY=$PROFILE_DIR/.tailscale/e2e-authkey
@@ -449,6 +450,112 @@ start_target() {
   KEY_DIR=""
 }
 
+# agent_exec [-t SECONDS] CMD: type CMD into the e2e session's shell and wait
+# for it to finish. Sets AGENT_OUT to what CMD printed and returns CMD's exit
+# status. Returns 124 when the END marker does not appear in time (AGENT_OUT
+# then holds the tail of the pane) and 125 when sending fails. Every "run
+# inside the agent" call goes through here, so a future Argus-free variant can
+# swap in `docker compose exec`. Call it directly, not inside $(...): the
+# command counter must survive between calls.
+AGENT_SEQ=0
+AGENT_OUT=""
+agent_exec() {
+  local deadline=$DEADLINE cmd id line pane="" result rc end
+  if [[ $1 == -t ]]; then
+    deadline=$2
+    shift 2
+  fi
+  cmd=$1
+  AGENT_SEQ=$((AGENT_SEQ + 1))
+  id=$RUN_ID-$AGENT_SEQ-$SRANDOM
+  # The markers are assembled by printf in the session, so the echoed command
+  # line never contains the literal ARGUS-E2E:END:<id> text.
+  line="printf '%s:%s:%s\n' ARGUS-E2E BEGIN $id; $cmd; printf '%s:%s:%s:rc=%d\n' ARGUS-E2E END $id \$?"
+  AGENT_OUT=""
+  if ! timeout "$STEP_TIMEOUT" argus session send "$SESSION" "$line" --enter >/dev/null 2>&1; then
+    AGENT_OUT="argus session send failed"
+    return 125
+  fi
+  end=$((SECONDS + deadline))
+  while ((SECONDS < end)); do
+    pane=$(timeout "$STEP_TIMEOUT" argus session peek "$SESSION" --all 2>/dev/null | strip_ctrl)
+    if result=$(marker_result "$id" <<<"$pane"); then
+      rc=${result%%$'\n'*}
+      AGENT_OUT=${result#*$'\n'}
+      return "${rc#rc=}"
+    fi
+    sleep 1
+  done
+  AGENT_OUT="timed out after ${deadline}s; last pane lines:"$'\n'$(tail -n 20 <<<"$pane")
+  return 124
+}
+
+# wait_shell_ready PHASE: type a harmless marker command every 5 seconds until
+# one shows up in the pane, which proves the shell is reading input.
+wait_shell_ready() {
+  local phase=$1 n=0 end=$((SECONDS + DEADLINE)) i
+  while ((SECONDS < end)); do
+    n=$((n + 1))
+    timeout "$STEP_TIMEOUT" argus session send "$SESSION" "printf '%s:%s\n' ARGUS-E2E READY-$phase-$RUN_ID-$n" --enter >/dev/null 2>&1
+    for i in 1 2 3 4 5; do
+      sleep 1
+      if timeout "$STEP_TIMEOUT" argus session peek "$SESSION" --all 2>/dev/null | strip_ctrl |
+        grep -q "^ARGUS-E2E:READY-$phase-$RUN_ID-"; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+daemon_needs_login() {
+  agent_exec -t "$API_DEADLINE" 'tailscale status --json | jq -e ".BackendState == \"NeedsLogin\"" >/dev/null'
+}
+
+agent_logged_in() {
+  # shellcheck disable=SC2016 # expands in the session's shell
+  agent_exec -t "$API_DEADLINE" "$(tmpl 'tailscale status --json | jq -e --arg h @H@ ".Self.HostName == \$h and .BackendState == \"Running\"" >/dev/null' H "$AGENT_HOST")"
+}
+
+start_agent() {
+  local rc
+  log "creating session $SESSION in profile $PROFILE"
+  REPO_CREATED=1
+  # shellcheck disable=SC2015 # the fallback runs when any step fails, as intended
+  mkdir -p "$REPO_DIR" &&
+    git -C "$REPO_DIR" init -q -b main &&
+    git -C "$REPO_DIR" -c user.name=argus-e2e -c user.email=argus-e2e@localhost commit -q --allow-empty -m "argus e2e $RUN_ID" ||
+    { log "creating the throwaway repo failed"; return 1; }
+  SESSION_CREATED=1
+  # A shell session brings the stack up lazily through the real Argus path.
+  timeout 600 argus session new "$SESSION" --provider shell --profile "$PROFILE" --src "$REPO_DIR" --branch "$SESSION" >/dev/null ||
+    { log "argus session new failed"; return 1; }
+
+  # Argus shell sessions exec "${SHELL:-/bin/bash}" -l, and docker exec does not
+  # set SHELL, so the login shell is bash. The assertions run in interactive
+  # zsh. exec keeps the environment the hook set up.
+  wait_shell_ready login || { log "the session shell never answered"; return 1; }
+  # shellcheck disable=SC2016 # expands in the session's shell
+  timeout "$STEP_TIMEOUT" argus session send "$SESSION" '[ -n "$ZSH_VERSION" ] || exec zsh -i' --enter >/dev/null ||
+    { log "sending the zsh switch failed"; return 1; }
+  wait_shell_ready zsh || { log "the session shell never answered after switching to zsh"; return 1; }
+  # shellcheck disable=SC2016 # expands in the session's shell
+  agent_exec 'test -n "$ZSH_VERSION"' || { log "the session shell is not zsh: $AGENT_OUT"; return 1; }
+  wait_until "$DEADLINE" daemon_needs_login ||
+    { log "tailscaled in the session never reported NeedsLogin: $AGENT_OUT"; return 1; }
+
+  mint_key "$AGENT_KEY" || { log "minting the agent's auth key failed"; return 1; }
+  # From here on, any login in the profile is this run's: preflight saw it
+  # logged out, or recovered the abandoned e2e login.
+  OWN_LOGIN=1
+  log "enrolling $AGENT_HOST"
+  agent_exec "timeout -k 5 45 tailscale up --auth-key=file:/var/lib/tailscale/e2e-authkey --hostname=$AGENT_HOST"
+  rc=$?
+  rm -f -- "$AGENT_KEY"
+  ((rc == 0)) || { log "tailscale up failed (rc=$rc): $AGENT_OUT"; return 1; }
+  wait_until "$DEADLINE" agent_logged_in || { log "the agent never came up as $AGENT_HOST: $AGENT_OUT"; return 1; }
+}
+
 # td NAME CMD...: run one teardown step. Report a failure and carry on.
 td() {
   local name=$1 out
@@ -491,7 +598,8 @@ main() {
   recover
   choose_probe
   start_target || die "the target node did not come up"
-  die "agent phase not implemented yet (target was ready)"
+  start_agent || die "the agent did not join the test tailnet"
+  die "assertions not implemented yet (agent is on the test tailnet)"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
