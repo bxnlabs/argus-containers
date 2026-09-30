@@ -9,19 +9,12 @@
 # run aborts before its assertions.
 set -uo pipefail
 
-# shellcheck disable=SC2034 # used by later phases
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# shellcheck disable=SC2034 # used by later phases
 IMAGE=ghcr.io/bxnlabs/argus-containers/profile:main
-# shellcheck disable=SC2034 # used by later phases
 E2E_TAG=tag:argus-e2e
-# shellcheck disable=SC2034 # used by later phases
 DEADLINE=60     # bound for polls and agent_exec calls, in seconds
-# shellcheck disable=SC2034 # used by later phases
 API_DEADLINE=15 # bound for a single Tailscale API or status call
-# shellcheck disable=SC2034 # used by later phases
 STEP_TIMEOUT=30 # bound for each argus, docker and compose call
-# shellcheck disable=SC2034 # used by later phases
 DEFAULT_GUARD_PREFIXES=100.64.0.0/10
 
 log() { printf '[e2e] %s\n' "$*" >&2; }
@@ -189,8 +182,316 @@ tmpl() {
 
 q() { printf '%q' "$1"; }
 
+parse_args() {
+  PROFILE=
+  while (($#)); do
+    case $1 in
+      --profile)
+        PROFILE=${2:-}
+        shift $(($# >= 2 ? 2 : 1))
+        ;;
+      --profile=*)
+        PROFILE=${1#*=}
+        shift
+        ;;
+      -h | --help)
+        sed -n '2,10p' "$0"
+        exit 0
+        ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [[ -n $PROFILE ]] || die "usage: $0 --profile NAME"
+  [[ $PROFILE =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid profile name: $PROFILE"
+}
+
+init_run() {
+  ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) || die "bash 5.1 or later is required"
+  STATE_DIR=$(resolve_state_dir) || die "cannot resolve the Argus state root"
+  PROFILE_DIR=$STATE_DIR/profiles/$PROFILE
+  CRED_FILE=$HOME/.config/argus-e2e/$PROFILE.env
+  RUN_ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+  NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  export RUN_ID NONCE
+  SESSION=argus-e2e-$RUN_ID
+  TARGET=argus-e2e-target-$RUN_ID
+  # shellcheck disable=SC2034 # used by later phases
+  AGENT_HOST=argus-e2e-agent-$RUN_ID
+  REPO_DIR=$STATE_DIR/tmp/argus-e2e-$RUN_ID
+  AGENT_KEY=$PROFILE_DIR/.tailscale/e2e-authkey
+  # Teardown acts only on what these record as this run's.
+  SESSION_CREATED=0 TARGET_STARTED=0 OWN_LOGIN=0 REPO_CREATED=0 PROBE_PID="" KEY_DIR=""
+  STACK_WAS_UP=0 ABANDONED_LOGIN=0 TOKEN="" PEER_IP="" TEARDOWN_ERRORS=0
+}
+
+# compose ARGS...: docker compose against the profile's stack, with the four
+# variables Argus passes, bounded by STEP_TIMEOUT.
+compose() {
+  ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$STATE_DIR ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
+    timeout "$STEP_TIMEOUT" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
+}
+
+stack_running() { compose ps --status running --services 2>/dev/null | grep -qx agent; }
+
+# guard_prefixes: the profile's NETGUARD_TAILNET_PREFIXES (netguard.sh's
+# default when unset). Fails when the profile has no netguard service.
+guard_prefixes() {
+  compose config --format json 2>/dev/null | jq -er --arg d "$DEFAULT_GUARD_PREFIXES" '
+    if .services.netguard == null then error("no netguard service")
+    else .services.netguard.environment.NETGUARD_TAILNET_PREFIXES // $d end'
+}
+
+# wait_until SECONDS CMD...: rerun CMD every 2 seconds until it succeeds or
+# SECONDS pass. CMD runs in this shell, so its side effects persist.
+wait_until() {
+  local end=$((SECONDS + $1))
+  shift
+  until "$@"; do
+    ((SECONDS < end)) || return 1
+    sleep 2
+  done
+}
+
+# ts_api METHOD PATH [JSON_BODY]: call the Tailscale API. The token goes in
+# through curl's stdin config, never argv.
+ts_api() {
+  local -a args=(-fsS --max-time "$API_DEADLINE" -X "$1" -K -)
+  [[ -n ${3:-} ]] && args+=(-H 'Content-Type: application/json' --data-binary "$3")
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl "${args[@]}" "https://api.tailscale.com/api/v2$2"
+}
+
+get_token() {
+  local resp
+  resp=$(printf 'client_id=%s&client_secret=%s' "$TS_E2E_OAUTH_CLIENT_ID" "$TS_E2E_OAUTH_CLIENT_SECRET" |
+    curl -fsS --max-time "$API_DEADLINE" --data-binary @- https://api.tailscale.com/api/v2/oauth/token) || return 1
+  TOKEN=$(jq -r '.access_token // empty' <<<"$resp")
+  [[ -n $TOKEN ]]
+}
+
+# mint_key FILE: mint a single-use, ephemeral, preauthorized auth key tagged
+# E2E_TAG that expires in 600 seconds, and write it to FILE with mode 0600.
+mint_key() {
+  local body resp key
+  body=$(jq -nc --arg tag "$E2E_TAG" \
+    '{capabilities: {devices: {create: {reusable: false, ephemeral: true, preauthorized: true, tags: [$tag]}}},
+      expirySeconds: 600, description: "argus-e2e"}')
+  resp=$(ts_api POST /tailnet/-/keys "$body") || return 1
+  key=$(jq -r '.key // empty' <<<"$resp")
+  [[ -n $key ]] || return 1
+  (umask 077 && printf '%s' "$key" >"$1")
+}
+
+delete_e2e_devices() {
+  local resp id rc=0
+  resp=$(ts_api GET /tailnet/-/devices) || return 1
+  for id in $(jq -r '.devices[] | select(.hostname | startswith("argus-e2e-")) | .nodeId // .id' <<<"$resp"); do
+    ts_api DELETE "/device/$id" >/dev/null || rc=1
+  done
+  return "$rc"
+}
+
+# logout_owned_login: end the run's login through compose exec, not the
+# session. Kill any `tailscale up` still running, restart tailscaled so an
+# enrollment pending inside the daemon is abandoned rather than completing
+# later, then log out. (logout alone returns early when no node key exists
+# yet, without cancelling a pending login.)
+logout_owned_login() {
+  # shellcheck disable=SC2016 # the script runs in the container, not here.
+  compose exec -T agent bash -c '
+    pkill -f "[t]ailscale up --auth-key" || true
+    supervisorctl -c /etc/supervisor/supervisord.conf restart tailscaled >/dev/null
+    for _ in $(seq 20); do tailscale status --json >/dev/null 2>&1 && break; sleep 1; done
+    tailscale logout >/dev/null 2>&1 || true
+    state=$(tailscale status --json | jq -r .BackendState)
+    [ "$state" = NeedsLogin ] || [ "$state" = NoState ] || { echo "tailscale is still $state"; exit 1; }'
+}
+
+preflight_checks() {
+  local c st uncovered
+  for c in argus docker curl jq timeout tailscale ss git od; do
+    command -v "$c" >/dev/null || die "missing host command: $c"
+  done
+  [[ -f $CRED_FILE ]] || die "missing $CRED_FILE (README: Tailnet-separation e2e)"
+  [[ $(stat -c %a -- "$CRED_FILE") == 600 ]] || die "$CRED_FILE must have mode 0600"
+  # shellcheck source=/dev/null
+  . "$CRED_FILE"
+  [[ -n ${TS_E2E_OAUTH_CLIENT_ID:-} && -n ${TS_E2E_OAUTH_CLIENT_SECRET:-} && -n ${TS_E2E_TAILNET:-} ]] ||
+    die "$CRED_FILE must set TS_E2E_OAUTH_CLIENT_ID, TS_E2E_OAUTH_CLIENT_SECRET and TS_E2E_TAILNET"
+
+  timeout "$STEP_TIMEOUT" argus session ls --json >/dev/null 2>&1 || die "the Argus node does not answer"
+  [[ $(timeout "$STEP_TIMEOUT" argus profile ls 2>/dev/null | awk -v p="$PROFILE" '$1 == p { print $2 }') == docker ]] ||
+    die "$PROFILE is not a dockerized Argus profile"
+  COMPOSE_FILE=$(find_compose_file "$PROFILE_DIR") || die "no compose file in $PROFILE_DIR"
+
+  HOST_STATUS=$(timeout "$API_DEADLINE" tailscale status --json 2>/dev/null) || die "host tailscale status failed"
+  [[ $(jq -r .BackendState <<<"$HOST_STATUS") == Running ]] || die "the host is not connected to its tailnet"
+  HOST_TAILNET=$(jq -r '.CurrentTailnet.Name // empty' <<<"$HOST_STATUS")
+  [[ -n $HOST_TAILNET ]] || die "cannot read the host's tailnet name"
+  [[ $HOST_TAILNET != "$TS_E2E_TAILNET" ]] || die "the host is on the test tailnet $TS_E2E_TAILNET"
+  HOST_TS_IP=$(jq -r '[.Self.TailscaleIPs[]? | select(test("^[0-9.]+$"))][0] // empty' <<<"$HOST_STATUS")
+  HOST_DNS=$(jq -r '(.Self.DNSName // "") | rtrimstr(".")' <<<"$HOST_STATUS")
+  HOST_DNS_SUFFIX=$(jq -r '.CurrentTailnet.MagicDNSSuffix // .MagicDNSSuffix // empty' <<<"$HOST_STATUS")
+  # shellcheck disable=SC2034 # used by later phases
+  HOST_IPS_JSON=$(jq -c '[.Self.TailscaleIPs[]?, .Peer[]?.TailscaleIPs[]?]' <<<"$HOST_STATUS")
+  [[ -n $HOST_TS_IP && -n $HOST_DNS && -n $HOST_DNS_SUFFIX ]] || die "cannot read the host's tailnet IP or MagicDNS name"
+  log "host tailnet $HOST_TAILNET: $HOST_DNS ($HOST_TS_IP)"
+
+  GUARD_PREFIXES=$(guard_prefixes) || die "cannot read NETGUARD_TAILNET_PREFIXES from $COMPOSE_FILE (is there a netguard service?)"
+  uncovered=$(ip -4 route show table 52 2>/dev/null | uncovered_routes "$GUARD_PREFIXES")
+  [[ -z $uncovered ]] ||
+    die "host Tailscale routes not covered by NETGUARD_TAILNET_PREFIXES=$GUARD_PREFIXES: $(tr '\n' ' ' <<<"$uncovered")"
+
+  if stack_running; then
+    STACK_WAS_UP=1
+    st=$(compose exec -T agent tailscale status --json 2>/dev/null)
+    case $(classify_login "$st" "$TS_E2E_TAILNET") in
+      logged-out) ;;
+      e2e) ABANDONED_LOGIN=1 ;;
+      *) die "the profile is logged in to a tailnet this e2e does not own; log it out first (tailscale logout)" ;;
+    esac
+  else
+    case $(state_file_login "$PROFILE_DIR/.tailscale/tailscaled.state") in
+      logged-out) ;;
+      logged-in) die "the stopped profile has a saved Tailscale login; start it and run tailscale logout first" ;;
+      *) die "cannot read $PROFILE_DIR/.tailscale/tailscaled.state" ;;
+    esac
+  fi
+  log "stack was $( ((STACK_WAS_UP)) && echo up || echo down ) before the test"
+}
+
+# recover: clean up after earlier crashed runs.
+recover() {
+  local ids id names n
+  if ((ABANDONED_LOGIN)); then
+    log "logging out a login left by an earlier e2e run"
+    OWN_LOGIN=1
+    logout_owned_login || die "could not log out the abandoned e2e login"
+  fi
+  ids=$(timeout "$STEP_TIMEOUT" argus session ls --json | jq -r '.sessions[] | select(.name | startswith("argus-e2e-")) | .id') ||
+    die "listing Argus sessions failed"
+  for id in $ids; do
+    log "deleting leftover session $id"
+    timeout "$STEP_TIMEOUT" argus session rm "$id" --force --delete-branch >/dev/null 2>&1 ||
+      timeout "$STEP_TIMEOUT" argus session rm "$id" --force >/dev/null ||
+      die "could not delete leftover session $id"
+  done
+  rm -rf -- "$STATE_DIR"/tmp/argus-e2e-*
+  names=$(timeout "$STEP_TIMEOUT" docker ps -a --filter 'name=^argus-e2e-target-' --format '{{.Names}}') ||
+    die "listing containers failed"
+  for n in $names; do
+    log "removing leftover container $n"
+    timeout "$STEP_TIMEOUT" docker rm -f "$n" >/dev/null || die "could not remove $n"
+  done
+  delete_e2e_devices || die "sweeping leftover argus-e2e devices failed"
+}
+
+start_probe_listener() {
+  local portfile
+  command -v python3 >/dev/null || return 1
+  portfile=$(mktemp) || return 1
+  timeout 900 python3 -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], 0))
+s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    s.accept()[0].close()' "$HOST_TS_IP" >"$portfile" 2>/dev/null &
+  PROBE_PID=$!
+  wait_until 10 test -s "$portfile"
+  PROBE_PORT=$(head -n1 "$portfile")
+  rm -f -- "$portfile"
+  [[ -n $PROBE_PORT ]]
+}
+
+# choose_probe: a TCP port the host listens on at its tailnet IP (starting a
+# throwaway listener if there is none), and one host-tailnet peer that answers
+# tailscale ping, if any.
+choose_probe() {
+  local ip
+  PROBE_PORT=$(ss -ltnH | awk -v ip="$HOST_TS_IP" '{
+      addr = $4; port = addr; sub(/.*:/, "", port); host = addr; sub(/:[^:]*$/, "", host)
+      if (host == "0.0.0.0" || host == "*" || host == ip) { print port; exit } }')
+  if [[ -z $PROBE_PORT ]]; then
+    start_probe_listener || die "nothing listens on $HOST_TS_IP and starting a probe listener failed (needs python3)"
+  fi
+  log "A4 probe: $HOST_TS_IP:$PROBE_PORT"
+  for ip in $(jq -r '.Peer[]? | select(.Online) | .TailscaleIPs[]? | select(test("^[0-9.]+$"))' <<<"$HOST_STATUS" | head -n 3); do
+    if timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$ip" >/dev/null 2>&1; then
+      PEER_IP=$ip
+      break
+    fi
+  done
+  log "A4 peer: ${PEER_IP:-none answering}"
+}
+
+target_ready() {
+  [[ $(timeout "$API_DEADLINE" docker exec "$TARGET" tailscale status --json 2>/dev/null | jq -r '.BackendState // empty') == Running ]] &&
+    [[ $(timeout "$API_DEADLINE" docker exec "$TARGET" curl -fsS --max-time 5 http://localhost:8080/ 2>/dev/null) == "$NONCE" ]]
+}
+
+start_target() {
+  log "starting target $TARGET"
+  KEY_DIR=$(mktemp -d) || return 1
+  mint_key "$KEY_DIR/authkey" || { log "minting the target's auth key failed"; return 1; }
+  TARGET_STARTED=1
+  timeout 600 docker run -d --name "$TARGET" \
+    -v "$REPO_ROOT/e2e/target:/e2e:ro" -v "$KEY_DIR:/run/e2e:ro" \
+    -e NONCE -e RUN_ID --entrypoint /e2e/run.sh "$IMAGE" >/dev/null ||
+    { log "docker run failed"; return 1; }
+  if ! wait_until "$DEADLINE" target_ready; then
+    log "the target never reported Running and served the nonce; its last log lines:"
+    timeout "$API_DEADLINE" docker logs --tail 30 "$TARGET" >&2
+    return 1
+  fi
+  rm -rf -- "$KEY_DIR"
+  KEY_DIR=""
+}
+
+# td NAME CMD...: run one teardown step. Report a failure and carry on.
+td() {
+  local name=$1 out
+  shift
+  if ! out=$("$@" 2>&1); then
+    TEARDOWN_ERRORS=$((TEARDOWN_ERRORS + 1))
+    log "teardown: $name failed: $out"
+  fi
+}
+
+# teardown: the EXIT trap. It acts only on what this run recorded as its own.
+# Every command it runs is bounded (STEP_TIMEOUT or API_DEADLINE). Errors are
+# reported but do not change the run's exit status.
+teardown() {
+  local rc=$?
+  trap - EXIT INT TERM
+  log "teardown"
+  ((SESSION_CREATED)) && td "delete session $SESSION" timeout "$STEP_TIMEOUT" argus session rm "$SESSION" --force --delete-branch
+  ((OWN_LOGIN)) && td "log out the e2e login" logout_owned_login
+  [[ -n $TOKEN ]] && td "delete argus-e2e devices" delete_e2e_devices
+  ((TARGET_STARTED)) && td "remove $TARGET" timeout "$STEP_TIMEOUT" docker rm -f "$TARGET"
+  [[ -n $PROBE_PID ]] && td "stop the probe listener" kill "$PROBE_PID"
+  ((REPO_CREATED)) && td "delete $REPO_DIR" rm -rf -- "$REPO_DIR"
+  [[ -n $KEY_DIR ]] && td "delete the target key" rm -rf -- "$KEY_DIR"
+  td "delete the agent key" rm -f -- "$AGENT_KEY"
+  ((STACK_WAS_UP)) || td "bring the stack down" timeout "$STEP_TIMEOUT" argus profile down "$PROFILE"
+  ((TEARDOWN_ERRORS)) && log "teardown finished with $TEARDOWN_ERRORS error(s)"
+  exit "$rc"
+}
+
 main() {
-  die "not implemented yet"
+  parse_args "$@"
+  init_run
+  log "run $RUN_ID: profile $PROFILE, state root $STATE_DIR"
+  preflight_checks
+  get_token || die "exchanging the OAuth client for an API token failed"
+  trap teardown EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  recover
+  choose_probe
+  start_target || die "the target node did not come up"
+  die "agent phase not implemented yet (target was ready)"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
