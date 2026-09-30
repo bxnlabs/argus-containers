@@ -230,10 +230,11 @@ init_run() {
   STACK_WAS_UP=0 ABANDONED_LOGIN=0 TOKEN="" PEER_IP="" TEARDOWN_ERRORS=0
 }
 
-# compose ARGS...: docker compose against the profile's stack, with the four
+# compose ARGS...: docker compose against the profile's stack, with the
 # variables Argus passes, bounded by STEP_TIMEOUT.
 compose() {
   ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$STATE_DIR ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
+    ARGUS_USER=$(id -un) ARGUS_GROUP=$(id -gn) ARGUS_HOSTNAME=$(hostname -s) \
     timeout "$STEP_TIMEOUT" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
 }
 
