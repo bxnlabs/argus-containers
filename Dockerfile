@@ -27,7 +27,7 @@ ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 RUN mkdir -p ${ARGUS_TOOLS}/bin ${ARGUS_TOOLS}/lib ${ARGUS_TOOLS}/share
 
 # Base development tools. No iptables: userspace Tailscale doesn't touch
-# netfilter. iproute2 is for the network guard.
+# netfilter. iproute2 is for the network guard. groff-base renders `aws help`.
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install --no-install-recommends --yes \
@@ -36,6 +36,7 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
         curl \
         git \
         gnupg \
+        groff-base \
         jq \
         less \
         make \

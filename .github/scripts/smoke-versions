@@ -56,6 +56,7 @@ check kubectl     FROM:alpine/k8s   kubectl version --client
 check helm        -                 helm version --short
 check k9s         K9S_VERSION       k9s version --short
 check aws         AWSCLI_VERSION    aws --version
+check aws-help    -                 sh -c 'PAGER=cat aws s3 help >/tmp/help && head -n 1 /tmp/help'
 check az          AZURE_CLI_VERSION az version --query '"azure-cli"' --output tsv
 check supervisord -                 supervisord --version
 check zsh         -                 zsh --version
