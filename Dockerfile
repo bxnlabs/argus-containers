@@ -6,7 +6,7 @@ FROM alpine/k8s:1.37.1@sha256:712dc5385d1c1a3f83b747fa9e40f64d433a97f72ff42f9755
 ############################
 # base: OS, dev tools, runtime config
 ############################
-FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e AS base
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS base
 
 LABEL org.opencontainers.image.source=https://github.com/bxnlabs/argus-containers
 
