@@ -72,7 +72,7 @@ ARG GCLOUD_VERSION=587.0.0
 # renovate: datasource=github-tags packageName=aws/aws-cli
 ARG AWSCLI_VERSION=2.37.9
 # renovate: datasource=pypi packageName=azure-cli
-ARG AZURE_CLI_VERSION=2.90.0
+ARG AZURE_CLI_VERSION=2.91.0
 # renovate: datasource=github-releases packageName=derailed/k9s
 ARG K9S_VERSION=0.51.0
 # renovate: datasource=node-version packageName=node
