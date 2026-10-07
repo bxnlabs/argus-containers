@@ -70,7 +70,7 @@ ARG PULUMI_VERSION=3.267.0
 # renovate: datasource=custom.gcloud packageName=google-cloud-cli
 ARG GCLOUD_VERSION=587.0.0
 # renovate: datasource=github-tags packageName=aws/aws-cli
-ARG AWSCLI_VERSION=2.37.9
+ARG AWSCLI_VERSION=2.37.10
 # renovate: datasource=pypi packageName=azure-cli
 ARG AZURE_CLI_VERSION=2.91.0
 # renovate: datasource=github-releases packageName=derailed/k9s
