@@ -78,7 +78,7 @@ ARG K9S_VERSION=0.51.0
 # renovate: datasource=node-version packageName=node
 ARG NODE_VERSION=24.21.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
-ARG CLAUDE_CODE_VERSION=2.1.292
+ARG CLAUDE_CODE_VERSION=2.1.293
 # renovate: datasource=npm packageName=@openai/codex
 ARG CODEX_VERSION=0.160.1
 # renovate: datasource=github-releases packageName=can1357/oh-my-pi
