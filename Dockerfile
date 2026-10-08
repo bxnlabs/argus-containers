@@ -68,7 +68,7 @@ ARG TAILSCALE_VERSION=1.104.1
 # renovate: datasource=github-releases packageName=pulumi/pulumi
 ARG PULUMI_VERSION=3.268.0
 # renovate: datasource=custom.gcloud packageName=google-cloud-cli
-ARG GCLOUD_VERSION=587.0.0
+ARG GCLOUD_VERSION=588.0.0
 # renovate: datasource=github-tags packageName=aws/aws-cli
 ARG AWSCLI_VERSION=2.37.10
 # renovate: datasource=pypi packageName=azure-cli
