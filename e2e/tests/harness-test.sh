@@ -116,8 +116,56 @@ nok authkey_file '{"services":{"agent":{"secrets":[{"source":"authkey"}]}}}'
 # parse_args requires --host-peer, a tailnet IPv4 address.
 nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p 2>/dev/null"
 nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 10.0.0.1 2>/dev/null"
-nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.79.139.70/32 2>/dev/null"
-ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.79.139.70 && [[ \$HOST_PEER == 100.79.139.70 ]]"
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1/32 2>/dev/null"
+ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 && [[ \$HOST_PEER == 100.64.0.1 ]]"
+
+# -h prints the header comment and nothing else.
+help=$("$here/../tailnet-separation.sh" -h)
+eq "help: last line" "# run aborts before its assertions." "$(tail -n 1 <<<"$help")"
+eq "help: first line" "# Tailnet-separation e2e for a dockerized Argus profile: the profile's" "$(head -n 1 <<<"$help")"
+
+# caps_exactly_net_admin reads /proc/<pid>/status text.
+ok caps_exactly_net_admin $'Name:\tx\nCapEff:\t0000000000001000\nCapBnd:\t0000000000001000'
+nok caps_exactly_net_admin $'CapEff:\t0000000000001000\nCapBnd:\t0000000000003000'
+nok caps_exactly_net_admin $'CapEff:\t0000000000000000\nCapBnd:\t0000000000001000'
+nok caps_exactly_net_admin $'CapEff:\t0000000000001000'
+nok caps_exactly_net_admin ''
+
+# logout_owned_login still logs out when the restarts and the health wait
+# fail, and reports the failure.
+tmp=$(mktemp -d)
+out=$(LOG=$tmp/calls bash -c '
+  . "$1"
+  DEADLINE=0
+  compose() {
+    printf "%s\n" "$*" >>"$LOG"
+    case "$*" in
+      "restart "*) return 1 ;;
+      "exec -T netguard tailscale status --json") echo "{\"BackendState\":\"NeedsLogin\"}" ;;
+      "exec -T netguard /opt/argus/bin/netguard.sh --check") return 1 ;;
+    esac
+  }
+  sleep() { :; }
+  logout_owned_login; echo "rc=$?"' _ "$here/../tailnet-separation.sh")
+eq "logout: reports the failed restarts" "rc=1" "$(tail -n 1 <<<"$out")"
+ok grep -qx "exec -T netguard tailscale logout" "$tmp/calls"
+ok grep -qx "exec -T netguard tailscale status --json" "$tmp/calls"
+ok grep -q "restart -t 5 agent" "$tmp/calls"
+rm -rf "$tmp"
+
+# teardown survives a second signal: TERM during the agent logout must not
+# stop it before the target logout.
+tmp=$(mktemp -d)
+LOG=$tmp/steps bash -c '
+  . "$1"
+  log() { :; }
+  OWN_LOGIN=1 TARGET_STARTED=1 STACK_WAS_UP=1 TEARDOWN_ERRORS=0 TARGET_PROJECT=t
+  logout_owned_login() { kill -TERM $$; sleep 0.3; echo agent >>"$LOG"; }
+  logout_target() { echo target >>"$LOG"; }
+  trap teardown EXIT
+  exit 0' _ "$here/../tailnet-separation.sh" >/dev/null 2>&1
+eq "teardown: both logouts after a second signal" $'agent\ntarget' "$(cat "$tmp/steps" 2>/dev/null)"
+rm -rf "$tmp"
 
 # tmpl keeps & and backslashes in values literally.
 eq "tmpl" 'curl http://a&b\c:8080/ -o x' "$(tmpl 'curl http://@H@:@P@/ -o x' H 'a&b\c' P 8080)"

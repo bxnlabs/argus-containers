@@ -17,13 +17,16 @@
 # `tailscale up`: joining a tailnet is a manual, one-time login.
 #
 # Usage: netguard.sh          add the guard routes, then run tailscaled
-#        netguard.sh --check  healthcheck: exit 0 when the guard is in place
-#                             and tailscaled answers on its socket
+#        netguard.sh --check  healthcheck: exit 0 when the guard is in place,
+#                             tailscaled answers on its socket, and the
+#                             operator, if any, is in effect
 #
 # NETGUARD_TAILNET_PREFIXES: IPv4 prefixes separated by commas or whitespace
 # (default 100.64.0.0/10). Add any subnet routes the host accepts.
 # NETGUARD_TS_OPERATOR: a user name in this image that may control tailscaled
-# without root (tailscale set --operator). Unset means only root may.
+# without root (tailscale set --operator). Unset means only root may. When it
+# is set but not in effect, the healthcheck fails, so the agent, which waits
+# for a healthy netguard, never starts with read-only access.
 set -euo pipefail
 
 sock=/var/run/tailscale/tailscaled.sock
@@ -59,11 +62,30 @@ tailscaled_answers() {
   timeout 5 tailscale --socket="$sock" status --json >/dev/null 2>&1
 }
 
+# operator_in_effect: NETGUARD_TS_OPERATOR names a user here and is
+# tailscaled's operator. tailscaled accepts any name, and resolves it to a uid
+# only when a client connects, so both halves need checking.
+operator_in_effect() {
+  local want=$NETGUARD_TS_OPERATOR got
+  if ! getent passwd "$want" >/dev/null; then
+    echo "netguard: operator $want is not a user in this image" >&2
+    return 1
+  fi
+  got=$(timeout 5 tailscale --socket="$sock" debug prefs 2>/dev/null | jq -r '.OperatorUser // empty')
+  if [[ $got != "$want" ]]; then
+    echo "netguard: tailscaled's operator is '$got', not $want" >&2
+    return 1
+  fi
+}
+
 if [[ ${1:-} == --check ]]; then
   guard_in_place
   if ! tailscaled_answers; then
     echo "netguard: tailscaled does not answer on $sock" >&2
     exit 1
+  fi
+  if [[ -n ${NETGUARD_TS_OPERATOR:-} ]]; then
+    operator_in_effect
   fi
   exit
 fi
@@ -85,16 +107,21 @@ tailscaled --tun=tailscale0 --statedir=/var/lib/tailscale --socket="$sock" \
 tsd=$!
 trap 'kill -TERM "$tsd" 2>/dev/null' TERM INT
 
+# Retry while tailscaled starts. On failure netguard keeps running for
+# inspection, and the healthcheck reports it.
 if [[ -n ${NETGUARD_TS_OPERATOR:-} ]]; then
-  for _ in $(seq 50); do
-    tailscaled_answers && break
-    kill -0 "$tsd" 2>/dev/null || break
-    sleep 0.2
+  deadline=$((SECONDS + 30))
+  until tailscale --socket="$sock" set --operator="$NETGUARD_TS_OPERATOR" 2>/dev/null &&
+    operator_in_effect 2>/dev/null; do
+    if ((SECONDS >= deadline)) || ! kill -0 "$tsd" 2>/dev/null; then
+      operator_in_effect || true
+      echo "netguard: could not make $NETGUARD_TS_OPERATOR tailscaled's operator; the healthcheck fails until it is" >&2
+      break
+    fi
+    sleep 0.5
   done
-  if tailscale --socket="$sock" set --operator="$NETGUARD_TS_OPERATOR"; then
+  if operator_in_effect 2>/dev/null; then
     echo "netguard: $NETGUARD_TS_OPERATOR may control tailscaled"
-  else
-    echo "netguard: setting the tailscaled operator to $NETGUARD_TS_OPERATOR failed" >&2
   fi
 fi
 

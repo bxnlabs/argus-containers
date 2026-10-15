@@ -280,6 +280,41 @@ expect_read_only() {
   fi
 }
 
+# expect_unhealthy CID DESC: netguard's healthcheck keeps failing.
+expect_unhealthy() {
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if docker exec "$1" /opt/argus/bin/netguard.sh --check >/dev/null 2>&1; then
+      fail "$2: the healthcheck passed"
+      return
+    fi
+    sleep 1
+  done
+  pass "$2"
+}
+
+# The healthcheck covers the operator: a name that resolves to no user, or an
+# operator changed after start, leaves the agent read-only, so the stack must
+# not count as healthy. tailscaled itself accepts any name.
+check_netguard_operator_health() {
+  local cid
+  cid=$(docker run -d "${netguard_args[@]}" -e NETGUARD_TS_OPERATOR=no-such-user \
+    --entrypoint /opt/argus/bin/netguard.sh "$image")
+  expect_unhealthy "$cid" "netguard is unhealthy when the operator is not a user"
+  docker rm -f "$cid" >/dev/null
+
+  cid=$(docker run -d "${netguard_args[@]}" -e NETGUARD_TS_OPERATOR=nobody \
+    --entrypoint /opt/argus/bin/netguard.sh "$image")
+  if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    docker exec "$cid" tailscale set --operator= >/dev/null
+    expect_unhealthy "$cid" "netguard is unhealthy when the operator is cleared"
+  else
+    fail "netguard with operator nobody never became healthy"
+    docker logs --tail 20 "$cid"
+  fi
+  docker rm -f "$cid" >/dev/null
+}
+
 # Without NETGUARD_TS_OPERATOR, netguard starts and sets no operator.
 check_netguard_no_operator() {
   local cid out
@@ -341,7 +376,7 @@ check_netguard_fails_loudly() {
 
 checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_no_agent_proxy check_net_tools)
 if have_tun; then
-  checks+=(check_netguard check_netguard_no_operator check_netguard_fails_loudly)
+  checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_fails_loudly)
 else
   echo "NOTE this Docker host has no /dev/net/tun; netguard's TUN checks are skipped"
   checks+=(check_tailscaled_socket_only)

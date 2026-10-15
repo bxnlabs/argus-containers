@@ -262,7 +262,7 @@ parse_args() {
         shift
         ;;
       -h | --help)
-        sed -n '2,19p' "$0"
+        sed -n '2,18p' "$0"
         exit 0
         ;;
       *) die "unknown argument: $1" ;;
@@ -345,6 +345,24 @@ netguard_status() {
   compose exec -T netguard tailscale status --json 2>/dev/null
 }
 
+# caps_exactly_net_admin STATUS: /proc/<pid>/status text has CapEff and
+# CapBnd both exactly CAP_NET_ADMIN (bit 12).
+caps_exactly_net_admin() {
+  local eff bnd
+  eff=$(awk '$1 == "CapEff:" { print $2 }' <<<"$1")
+  bnd=$(awk '$1 == "CapBnd:" { print $2 }' <<<"$1")
+  [[ $eff == 0000000000001000 && $bnd == 0000000000001000 ]]
+}
+
+# netguard_caps: netguard's entrypoint runs with exactly NET_ADMIN.
+netguard_caps() {
+  local st
+  st=$(compose exec -T netguard cat /proc/1/status) || return 1
+  caps_exactly_net_admin "$st" && return 0
+  grep -E '^Cap(Eff|Bnd):' <<<"$st"
+  return 1
+}
+
 netguard_healthy() {
   compose exec -T netguard /opt/argus/bin/netguard.sh --check >/dev/null 2>&1
 }
@@ -354,22 +372,21 @@ netguard_healthy() {
 # then the agent, which would otherwise keep the old network namespace) so an
 # enrollment pending inside the daemon is abandoned rather than completing
 # later, then log out. (logout alone returns early when no node key exists
-# yet, without cancelling a pending login.)
+# yet, without cancelling a pending login.) The restarts are best-effort: the
+# logout is always attempted, and any failure is reported at the end.
 logout_owned_login() {
-  local state
+  local state errs=()
   compose exec -T agent pkill -f '[t]ailscale up --auth-key' >/dev/null 2>&1
-  compose restart -t 5 netguard >/dev/null || return 1
-  compose restart -t 5 agent >/dev/null || return 1
-  wait_until "$DEADLINE" netguard_healthy || {
-    echo "netguard did not become healthy after its restart"
-    return 1
-  }
+  compose restart -t 5 netguard >/dev/null 2>&1 || errs+=("restarting netguard failed")
+  compose restart -t 5 agent >/dev/null 2>&1 || errs+=("restarting the agent failed")
+  wait_until "$DEADLINE" netguard_healthy || errs+=("netguard did not become healthy after its restart")
   compose exec -T netguard tailscale logout >/dev/null 2>&1
-  state=$(netguard_status | jq -r .BackendState)
-  [[ $state == NeedsLogin || $state == NoState ]] || {
-    echo "tailscale is still $state"
-    return 1
-  }
+  state=$(netguard_status | jq -r .BackendState 2>/dev/null)
+  [[ $state == NeedsLogin || $state == NoState ]] || errs+=("tailscale is still ${state:-unreadable}")
+  ((${#errs[@]} == 0)) && return 0
+  local IFS=';'
+  echo "${errs[*]}"
+  return 1
 }
 
 # logout_target PROJECT: log a target node out, which removes it from the
@@ -585,6 +602,7 @@ a1_joined_as_operator() {
   stack_step "joined $AGENT_HOST on a tailnet other than the host's" "$(tmpl 's=$(tailscale status --json); printf "%s\n" "$s" | jq -c "{BackendState, tailnet: .CurrentTailnet.Name, host: .Self.HostName}"; printf "%s\n" "$s" | jq -e --arg h @H@ --arg host_tn @TN@ ".BackendState == \"Running\" and .Self.HostName == \$h and (.CurrentTailnet.Name // \"\") != \"\" and .CurrentTailnet.Name != \$host_tn" >/dev/null' \
     H "$AGENT_HOST" TN "$(q "$HOST_TAILNET")")" || failed=1
   stack_step "tailscale set works from the agent" 'tailscale set --accept-routes=false' || failed=1
+  on_host "netguard has exactly NET_ADMIN" netguard_caps || failed=1
   stack_step "no firewall health warnings" 'h=$(tailscale status --json | jq -r ".Health[]?"); printf "%s\n" "$h"; ! printf "%s\n" "$h" | grep -qiE "firewall|netfilter|iptables|nftables"' || failed=1
   return "$failed"
 }
@@ -780,7 +798,10 @@ td() {
 # run's exit status.
 teardown() {
   local rc=$?
-  trap - EXIT INT TERM
+  # Ignore further signals: every step below is bounded, and an interrupted
+  # teardown would leave nodes on the tailnet.
+  trap - EXIT
+  trap '' INT TERM
   log "teardown"
   ((OWN_LOGIN)) && td "log out the agent's login" logout_owned_login
   ((TARGET_STARTED)) && td "log out and remove $TARGET_PROJECT" logout_target "$TARGET_PROJECT"
