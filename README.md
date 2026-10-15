@@ -40,7 +40,8 @@ FROM ghcr.io/bxnlabs/argus-containers/profile:main
 # Host-matching identity: the host's uid, gid, user name and group name. Free
 # each first (ubuntu ships uid/gid 1000 as the `ubuntu` user, and a `staff`
 # group with gid 50). HOME points at the mounted host home (-M: reference the
-# mount, don't create it).
+# mount, don't create it). USER is not set by docker exec; `tailscale up`
+# needs it to keep the user as tailscaled's operator.
 ARG ARGUS_UID
 ARG ARGUS_GID
 ARG ARGUS_USER
@@ -53,7 +54,7 @@ RUN set -eux; \
     if getent group  "$ARGUS_GROUP" >/dev/null; then groupdel "$ARGUS_GROUP"; fi; \
     groupadd -g "$ARGUS_GID" "$ARGUS_GROUP"; \
     useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /usr/bin/zsh "$ARGUS_USER"
-ENV HOME=$ARGUS_HOST_HOME
+ENV HOME=$ARGUS_HOST_HOME USER=$ARGUS_USER
 USER $ARGUS_USER
 ```
 
@@ -125,7 +126,7 @@ Argus passes `ARGUS_HOST_HOME`, `ARGUS_STATE_DIR`, `ARGUS_UID` and `ARGUS_GID` t
 
 `hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network. It is also the name `tailscale up` registers the profile under; pass `--hostname` to register a different one.
 
-`netguard` runs tailscaled and keeps its state in `.tailscale`. The agent mounts only tailscaled's socket, so the `tailscale` CLI works there. `NETGUARD_TS_OPERATOR` names the user that may change tailscaled's settings without root, which is the agent's user here; leave it unset and only root in `netguard` can. Pick a free host port for each profile's proxy (`10551` above).
+`netguard` runs tailscaled and keeps its state in `.tailscale`. The agent mounts only tailscaled's socket, so the `tailscale` CLI works there. `NETGUARD_TS_OPERATOR` names the user that may change tailscaled's settings without root, which is the agent's user here; leave it unset and only root in `netguard` can. `tailscale up` keeps the operator only when `$USER` names it, which is why the Dockerfile sets `USER`; without it, the first `tailscale up` clears the operator and `netguard` turns unhealthy. Pick a free host port for each profile's proxy (`10551` above).
 
 ### hooks/post_create.sh
 
