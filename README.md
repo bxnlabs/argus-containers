@@ -180,7 +180,7 @@ mkdir -p .home .tailscale && chmod 0700 .tailscale
 argus profile up <name>
 ```
 
-Agent credentials and settings are not in the image. They live in the profile's `.home`. Open a shell session in the profile and log in to each agent you use once (`claude`, `codex login`, `agy`, `omp`). The login persists across restarts and image updates.
+Sessions run on the host, so agents use the host user's own credentials and settings in the host's `$HOME`, not the image or the profile's `.home`. If you haven't logged in to an agent on the host yet, open a shell session in the profile and log in once (`claude`, `codex login`, `agy`, `omp`). The profile's `.home` is the `$HOME` of commands run with `argus profile exec --compose`.
 
 To join a tailnet, run `argus profile exec --compose <name> -- tailscale up`. The login persists in `.tailscale/`.
 
