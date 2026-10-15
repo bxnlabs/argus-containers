@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
 # Tailnet-separation e2e for a dockerized Argus profile: the profile's
-# container joins a test tailnet that is not the host's, and the two stay
-# separate. Prerequisites and usage: README.md, "Tailnet-separation e2e".
+# netguard joins a test tailnet that is not the host's, the agent reaches it
+# by native routing, the host reaches it through the published proxy, and
+# neither path reaches the host's own tailnet. Prerequisites and usage:
+# README.md, "Tailnet-separation e2e".
 #
-# Usage: e2e/tailnet-separation.sh --profile NAME
+# Usage: e2e/tailnet-separation.sh --profile NAME --host-peer IP
+#
+# --host-peer is the one host-tailnet address the run probes. It must answer
+# on TCP port 22 from the host. No other host-tailnet address is contacted.
+#
+# The auth key comes from the profile's compose secret `authkey`. It must be
+# reusable (the run enrolls two nodes), ephemeral (logout removes them) and
+# pre-approved. The script never reads it.
 #
 # Exit status: 0 when every assertion passes, 1 when any fails, and 2 when the
 # run aborts before its assertions.
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=ghcr.io/bxnlabs/argus-containers/profile:main
-E2E_TAG=tag:argus-e2e
-DEADLINE=60     # bound for polls and agent_exec calls, in seconds
-API_DEADLINE=15 # bound for a single Tailscale API or status call
+TARGET_COMPOSE=$REPO_ROOT/e2e/target/compose.yaml
+TARGET_IMAGE=ghcr.io/bxnlabs/argus-containers/profile:main
+POSTGRES_IMAGE=postgres:16-alpine
+HOST_PEER_PORT=22
+DEADLINE=60     # bound for polls, in seconds
+API_DEADLINE=15 # bound for a single status call
 STEP_TIMEOUT=30 # bound for each argus, docker and compose call
+STACK_TIMEOUT=900 # bound for the calls that first bring up the stack (it may build) and the target
 DEFAULT_GUARD_PREFIXES=100.64.0.0/10
 
 log() { printf '[e2e] %s\n' "$*" >&2; }
@@ -75,19 +87,26 @@ cidr_covers() {
   (((o & mask) == (i & mask)))
 }
 
-# uncovered_routes PREFIXES: read `ip -4 route show table 52` on stdin and
-# print each destination routed out of tailscale0 that no prefix in PREFIXES
-# (commas or whitespace between them) covers. `default` is 0.0.0.0/0.
+# host_routes STATUS_JSON ROUTE_ALL: print each IPv4 destination the host
+# routes into its tailnet beyond its peers' own addresses: the subnet routes
+# its peers serve, unless ROUTE_ALL is "false" (the host does not accept
+# them), and 0.0.0.0/0 when it uses an exit node.
+host_routes() {
+  jq -r --arg ra "$2" '
+    ((if $ra == "false" then [] else [.Peer[]?.PrimaryRoutes[]?] end)
+      + (if .ExitNodeStatus then ["0.0.0.0/0"] else [] end))
+    | .[] | select(test(":") | not)' <<<"$1"
+}
+
+# uncovered_routes PREFIXES: read one destination per line on stdin and print
+# each that no prefix in PREFIXES (commas or whitespace between them) covers.
 uncovered_routes() {
-  local line dst rest p covered raw=${1//$'\n'/ }
+  local dst p covered raw=${1//$'\n'/ }
   local -a prefixes
   # Parse PREFIXES as netguard.sh does, newlines included.
   read -r -a prefixes <<<"${raw//,/ }"
-  while IFS= read -r line; do
-    [[ $line == *" dev tailscale0"* ]] || continue
-    read -r dst rest <<<"$line"
-    case $dst in unicast | local | broadcast | multicast) read -r dst <<<"$rest" ;; esac
-    [[ $dst == default ]] && dst=0.0.0.0/0
+  while read -r dst; do
+    [[ -n $dst ]] || continue
     covered=0
     for p in "${prefixes[@]}"; do
       if cidr_covers "$p" "$dst"; then
@@ -99,76 +118,38 @@ uncovered_routes() {
   done
 }
 
-# classify_login JSON TAILNET: classify a running profile's Tailscale login
-# from `tailscale status --json`. Prints logged-out, e2e (a login an earlier
-# e2e run left behind on TAILNET), or foreign (anything else, including
-# unparseable input).
+# classify_login JSON HOST_TAILNET: classify a running profile's Tailscale
+# login from `tailscale status --json`. Prints logged-out, e2e (a login an
+# earlier e2e run left behind on a tailnet other than the host's), or foreign
+# (anything else, including unparseable input).
 classify_login() {
   local out
-  out=$(jq -r --arg tn "$2" '
+  out=$(jq -r --arg host_tn "$2" '
     (.CurrentTailnet.Name // "") as $cur
     | (.Self.HostName // "") as $host
     | if ((.BackendState == "NeedsLogin" or .BackendState == "NoState") and $cur == "") then "logged-out"
-      elif ($cur == $tn and ($host | startswith("argus-e2e-agent-"))) then "e2e"
+      elif ($cur != "" and $cur != $host_tn and ($host | test("^argus-e2e-agent-[0-9a-f]{8}$"))) then "e2e"
       else "foreign" end' <<<"$1" 2>/dev/null)
   printf '%s\n' "${out:-foreign}"
 }
 
-# state_file_login FILE: whether a stopped profile's tailscaled.state holds a
-# login. It does only when _current-profile names a profile that still exists
-# in _profiles: logout deletes the profile but can leave the pointer behind.
-# Fails when the file cannot be read or parsed.
-state_file_login() {
-  local file=$1 json cur profiles
-  if [[ ! -e $file ]]; then
-    echo logged-out
-    return 0
-  fi
-  json=$(cat -- "$file") || return 1
-  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$json" || return 1
-  cur=$(jq -r '."_current-profile" // ""' <<<"$json" | base64 -d 2>/dev/null) || return 1
-  if [[ -z $cur ]]; then
-    echo logged-out
-    return 0
-  fi
-  profiles=$(jq -r '."_profiles" // ""' <<<"$json" | base64 -d 2>/dev/null) || return 1
-  if [[ -z $profiles ]]; then
-    echo logged-out
-    return 0
-  fi
-  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$profiles" || return 1
-  # tailscaled stores the profile's state key (its Key field, "profile-<ID>")
-  # in _current-profile. A bare ID is accepted too.
-  if jq -e --arg k "$cur" 'has($k) or any(.[]; .Key? == $k)' >/dev/null <<<"$profiles"; then
-    echo logged-in
-  else
-    echo logged-out
-  fi
+# proxy_port CONFIG_JSON: the host port that publishes netguard's port 1055
+# on 127.0.0.1, from `docker compose config --format json`.
+proxy_port() {
+  jq -er '[.services.netguard.ports[]?
+    | select((.target | tostring) == "1055" and .host_ip == "127.0.0.1")
+    | .published | tostring][0] // empty' <<<"$1"
 }
 
-# marker_result ID: read captured pane text on stdin. When the END marker for
-# ID is there, print "rc=<n>" and then the lines between the BEGIN and END
-# markers, and succeed; otherwise fail. Output that did not end in a newline
-# shares its last line with the END marker, so the marker is found anywhere in
-# a line.
-marker_result() {
-  awk -v id="$1" '
-    { sub(/[ \t\r]+$/, "") }
-    $0 == "ARGUS-E2E:BEGIN:" id { inside = 1; body = ""; next }
-    inside && (p = index($0, "ARGUS-E2E:END:" id ":rc=")) > 0 {
-      if (p > 1) body = body substr($0, 1, p - 1) "\n"
-      rc = substr($0, p + length("ARGUS-E2E:END:" id ":rc="))
-      if (rc ~ /^[0-9]+$/) { found = 1; result = body }
-      inside = 0
-      next
-    }
-    inside { body = body $0 "\n" }
-    END { if (!found) exit 1; printf "rc=%s\n%s", rc, result }'
+# authkey_file CONFIG_JSON: the file behind the compose secret `authkey`,
+# when the agent service mounts it.
+authkey_file() {
+  jq -er 'select(any(.services.agent.secrets[]?; .source == "authkey")) | .secrets.authkey.file // empty' <<<"$1"
 }
 
-# strip_ctrl: drop control characters (other than tab and newline) from text
-# read back from the session.
-strip_ctrl() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
+# is_target_project NAME: whether NAME is a target compose project this
+# script generates. recover removes only these.
+is_target_project() { [[ $1 =~ ^e2e-tailnet-target-[0-9a-f]{8}$ ]]; }
 
 # tmpl TEMPLATE [NAME VALUE]...: replace each @NAME@ in TEMPLATE with VALUE,
 # literally.
@@ -184,66 +165,143 @@ tmpl() {
 
 q() { printf '%q' "$1"; }
 
-# is_run_name NAME: whether NAME is a session or repo name this script
-# generates (argus-e2e- and an 8-hex-digit run ID). recover deletes only
-# these, never other sessions that merely share the prefix.
-is_run_name() { [[ $1 =~ ^argus-e2e-[0-9a-f]{8}$ ]]; }
+# PROBE: a TCP probe, run with python3 on the host and in the agent.
+#   connect HOST PORT              exit 0 when it connects, 1 when refused or
+#                                  unreachable, 2 on a timeout or other error
+#   unreachable HOST PORT          exit 0 only on EHOSTUNREACH or ENETUNREACH
+#   socks HOST PORT PROXY_PORT     SOCKS5 CONNECT through 127.0.0.1:PROXY_PORT
+#   http HOST PORT PROXY_PORT      HTTP CONNECT through 127.0.0.1:PROXY_PORT
+# The proxy modes exit 0 when the proxy connects, 1 when it answers with a
+# refusal, and 2 when it does not answer.
+# shellcheck disable=SC2016 # Python, not shell
+PROBE='
+import errno, socket, sys
+mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def done(msg, rc):
+    print(msg)
+    sys.exit(rc)
+if mode in ("connect", "unreachable"):
+    s = socket.socket()
+    s.settimeout(5)
+    try:
+        r = s.connect_ex((host, port))
+    except socket.timeout:
+        done("timeout", 2)
+    name = errno.errorcode.get(r, r) if r else "connected"
+    if mode == "unreachable":
+        done(name, 0 if r in (errno.EHOSTUNREACH, errno.ENETUNREACH) else 1)
+    done(name, 0 if r == 0 else (1 if r in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH) else 2))
+try:
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[4])), timeout=15)
+    if mode == "socks":
+        s.sendall(b"\x05\x01\x00")
+        if s.recv(2) != b"\x05\x00":
+            done("no SOCKS5 greeting", 2)
+        s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + port.to_bytes(2, "big"))
+        r = s.recv(10)
+        if len(r) < 2:
+            done("no SOCKS5 reply", 2)
+        done("socks reply %d" % r[1], 0 if r[1] == 0 else 1)
+    s.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode())
+    line = s.makefile("rb").readline().decode(errors="replace").strip()
+    if not line:
+        done("no HTTP reply", 2)
+    done(line, 0 if line.split()[1:2] == ["200"] else 1)
+except OSError as e:
+    done("error: %s" % e, 2)
+'
 
 parse_args() {
-  PROFILE=
+  PROFILE="" HOST_PEER=""
   while (($#)); do
     case $1 in
-      --profile)
-        PROFILE=${2:-}
-        shift $(($# >= 2 ? 2 : 1))
+      --profile | --host-peer)
+        local flag=$1
+        (($# >= 2)) || die "$flag needs a value"
+        if [[ $flag == --profile ]]; then PROFILE=$2; else HOST_PEER=$2; fi
+        shift 2
         ;;
       --profile=*)
         PROFILE=${1#*=}
         shift
         ;;
+      --host-peer=*)
+        HOST_PEER=${1#*=}
+        shift
+        ;;
       -h | --help)
-        sed -n '2,10p' "$0"
+        sed -n '2,18p' "$0"
         exit 0
         ;;
       *) die "unknown argument: $1" ;;
     esac
   done
-  [[ -n $PROFILE ]] || die "usage: $0 --profile NAME"
+  [[ -n $PROFILE && -n $HOST_PEER ]] || die "usage: $0 --profile NAME --host-peer IP"
   [[ $PROFILE =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid profile name: $PROFILE"
+  if [[ $HOST_PEER == */* ]] || ! cidr_covers 100.64.0.0/10 "$HOST_PEER"; then
+    die "--host-peer must be a tailnet IPv4 address in 100.64.0.0/10, got $HOST_PEER"
+  fi
 }
 
 init_run() {
   ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) || die "bash 5.1 or later is required"
   STATE_DIR=$(resolve_state_dir) || die "cannot resolve the Argus state root"
   PROFILE_DIR=$STATE_DIR/profiles/$PROFILE
-  CRED_FILE=$HOME/.config/argus-e2e/$PROFILE.env
   RUN_ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
   NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  export RUN_ID NONCE
-  SESSION=argus-e2e-$RUN_ID
-  TARGET=argus-e2e-target-$RUN_ID
+  TARGET_PROJECT=e2e-tailnet-target-$RUN_ID
   AGENT_HOST=argus-e2e-agent-$RUN_ID
-  REPO_DIR=$STATE_DIR/tmp/argus-e2e-$RUN_ID
-  AGENT_KEY=$PROFILE_DIR/.tailscale/e2e-authkey
   # Teardown acts only on what these record as this run's.
-  SESSION_CREATED=0 TARGET_STARTED=0 OWN_LOGIN=0 REPO_CREATED=0 PROBE_PID="" KEY_DIR=""
-  STACK_WAS_UP=0 ABANDONED_LOGIN=0 TOKEN="" PEER_IP="" TEARDOWN_ERRORS=0
+  TARGET_STARTED=0 OWN_LOGIN=0 STACK_WAS_UP=0 TEARDOWN_ERRORS=0
+  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS=""
 }
 
 # compose ARGS...: docker compose against the profile's stack, with the
-# variables Argus passes, bounded by STEP_TIMEOUT.
+# variables Argus passes, bounded by STEP_TIMEOUT (or -t SECONDS).
 compose() {
+  local t=$STEP_TIMEOUT
+  if [[ $1 == -t ]]; then
+    t=$2
+    shift 2
+  fi
   ARGUS_HOST_HOME=$HOME ARGUS_STATE_DIR=$STATE_DIR ARGUS_UID=$(id -u) ARGUS_GID=$(id -g) \
     ARGUS_USER=$(id -un) ARGUS_GROUP=$(id -gn) ARGUS_HOSTNAME=$(hostname -s) \
-    timeout "$STEP_TIMEOUT" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
+    timeout "$t" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
 }
 
-# guard_prefixes: the profile's NETGUARD_TAILNET_PREFIXES (netguard.sh's
-# default when unset). Fails when the profile has no netguard service.
-guard_prefixes() {
-  compose config --format json 2>/dev/null | jq -er --arg d "$DEFAULT_GUARD_PREFIXES" '
-    if .services.netguard == null then error("no netguard service")
-    else .services.netguard.environment.NETGUARD_TAILNET_PREFIXES // $d end'
+# compose_target [-t SECONDS] PROJECT ARGS...: docker compose against a target
+# project, bounded by STEP_TIMEOUT (or -t SECONDS).
+compose_target() {
+  local t=$STEP_TIMEOUT project
+  if [[ $1 == -t ]]; then
+    t=$2
+    shift 2
+  fi
+  project=$1
+  shift
+  E2E_KEY_FILE=$KEY_FILE E2E_TARGET_IMAGE=$TARGET_IMAGE E2E_POSTGRES_IMAGE=$POSTGRES_IMAGE \
+    NONCE=$NONCE RUN_ID=$RUN_ID \
+    timeout "$t" docker compose -p "$project" -f "$TARGET_COMPOSE" "$@"
+}
+
+# in_stack [-t SECONDS] CMD: run CMD with bash in the profile stack's agent
+# service through `argus profile exec --compose`, as the agent's user. Sets
+# OUT to its output and returns its status. The working directory is $HOME,
+# which every profile mounts.
+in_stack() {
+  local t=$STEP_TIMEOUT
+  if [[ $1 == -t ]]; then
+    t=$2
+    shift 2
+  fi
+  OUT=$(cd "$HOME" && timeout "$t" argus profile exec --compose "$PROFILE" -- bash -c "$1" </dev/null 2>&1)
+}
+
+# on_host_hooked CMD: run CMD with bash on the host in the profile's
+# environment (its post_create hook sourced, as for a session) through
+# `argus profile exec`. Sets OUT and returns CMD's status.
+on_host_hooked() {
+  OUT=$(cd "$HOME" && timeout "$STEP_TIMEOUT" argus profile exec "$PROFILE" -- bash -c "$1" </dev/null 2>&1)
 }
 
 # wait_until SECONDS CMD...: rerun CMD every 2 seconds until it succeeds or
@@ -257,316 +315,206 @@ wait_until() {
   done
 }
 
-# ts_api METHOD PATH [JSON_BODY]: call the Tailscale API. The token goes in
-# through curl's stdin config, never argv.
-ts_api() {
-  local -a args=(-fsS --max-time "$API_DEADLINE" -X "$1" -K -)
-  [[ -n ${3:-} ]] && args+=(-H 'Content-Type: application/json' --data-binary "$3")
-  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl "${args[@]}" "https://api.tailscale.com/api/v2$2"
+netguard_status() {
+  compose exec -T netguard tailscale status --json 2>/dev/null
 }
 
-get_token() {
-  local resp
-  resp=$(printf 'client_id=%s&client_secret=%s' "$TS_E2E_OAUTH_CLIENT_ID" "$TS_E2E_OAUTH_CLIENT_SECRET" |
-    curl -fsS --max-time "$API_DEADLINE" --data-binary @- https://api.tailscale.com/api/v2/oauth/token) || return 1
-  TOKEN=$(jq -r '.access_token // empty' <<<"$resp")
-  [[ -n $TOKEN ]]
+# caps_exactly_net_admin STATUS: /proc/<pid>/status text has CapEff and
+# CapBnd both exactly CAP_NET_ADMIN (bit 12).
+caps_exactly_net_admin() {
+  local eff bnd
+  eff=$(awk '$1 == "CapEff:" { print $2 }' <<<"$1")
+  bnd=$(awk '$1 == "CapBnd:" { print $2 }' <<<"$1")
+  [[ $eff == 0000000000001000 && $bnd == 0000000000001000 ]]
 }
 
-# mint_key FILE: mint a single-use, ephemeral, preauthorized auth key tagged
-# E2E_TAG that expires in 600 seconds, and write it to FILE with mode 0600.
-mint_key() {
-  local body resp key
-  body=$(jq -nc --arg tag "$E2E_TAG" \
-    '{capabilities: {devices: {create: {reusable: false, ephemeral: true, preauthorized: true, tags: [$tag]}}},
-      expirySeconds: 600, description: "argus-e2e"}')
-  resp=$(ts_api POST /tailnet/-/keys "$body") || return 1
-  key=$(jq -r '.key // empty' <<<"$resp")
-  [[ -n $key ]] || return 1
-  (umask 077 && printf '%s' "$key" >"$1")
+# netguard_caps: netguard's entrypoint runs with exactly NET_ADMIN.
+netguard_caps() {
+  local st
+  st=$(compose exec -T netguard cat /proc/1/status) || return 1
+  caps_exactly_net_admin "$st" && return 0
+  grep -E '^Cap(Eff|Bnd):' <<<"$st"
+  return 1
 }
 
-delete_e2e_devices() {
-  local resp id rc=0
-  resp=$(ts_api GET /tailnet/-/devices) || return 1
-  for id in $(jq -r '.devices[] | select(.hostname | startswith("argus-e2e-")) | .nodeId // .id' <<<"$resp"); do
-    ts_api DELETE "/device/$id" >/dev/null || rc=1
-  done
+netguard_healthy() {
+  compose exec -T netguard /opt/argus/bin/netguard.sh --check >/dev/null 2>&1
+}
+
+# logout_owned_login: end the run's login as root in netguard. Kill any
+# `tailscale up` still running in the agent, restart tailscaled (netguard,
+# then the agent, which would otherwise keep the old network namespace) so an
+# enrollment pending inside the daemon is abandoned rather than completing
+# later, then log out. (logout alone returns early when no node key exists
+# yet, without cancelling a pending login.) The restarts are best-effort: the
+# logout is always attempted, and any failure is reported at the end.
+logout_owned_login() {
+  local state errs=()
+  compose exec -T agent pkill -f '[t]ailscale up --auth-key' >/dev/null 2>&1
+  compose restart -t 5 netguard >/dev/null 2>&1 || errs+=("restarting netguard failed")
+  compose restart -t 5 agent >/dev/null 2>&1 || errs+=("restarting the agent failed")
+  wait_until "$DEADLINE" netguard_healthy || errs+=("netguard did not become healthy after its restart")
+  compose exec -T netguard tailscale logout >/dev/null 2>&1
+  state=$(netguard_status | jq -r .BackendState 2>/dev/null)
+  [[ $state == NeedsLogin || $state == NoState ]] || errs+=("tailscale is still ${state:-unreadable}")
+  ((${#errs[@]} == 0)) && return 0
+  local IFS=';'
+  echo "${errs[*]}"
+  return 1
+}
+
+# logout_target PROJECT: log a target node out, which removes it from the
+# tailnet because its key is ephemeral, then remove the project.
+logout_target() {
+  local rc=0
+  compose_target "$1" exec -T node tailscale logout >/dev/null || rc=1
+  compose_target "$1" down -v -t 1 --remove-orphans >/dev/null || rc=1
   return "$rc"
 }
 
-# logout_owned_login: end the run's login through compose exec, not the
-# session. Kill any `tailscale up` still running, restart tailscaled so an
-# enrollment pending inside the daemon is abandoned rather than completing
-# later, then log out. (logout alone returns early when no node key exists
-# yet, without cancelling a pending login.)
-logout_owned_login() {
-  # shellcheck disable=SC2016 # the script runs in the container, not here.
-  compose exec -T agent bash -c '
-    pkill -f "[t]ailscale up --auth-key" || true
-    supervisorctl -c /etc/supervisor/supervisord.conf restart tailscaled >/dev/null
-    for _ in $(seq 20); do tailscale status --json >/dev/null 2>&1 && break; sleep 1; done
-    tailscale logout >/dev/null 2>&1 || true
-    state=$(tailscale status --json | jq -r .BackendState)
-    [ "$state" = NeedsLogin ] || [ "$state" = NoState ] || { echo "tailscale is still $state"; exit 1; }'
-}
-
 preflight_checks() {
-  local c st uncovered services
-  for c in argus docker curl jq timeout tailscale ip python3 git od; do
+  local c uncovered services route_all host_routes_list
+  for c in argus docker curl jq timeout tailscale python3 od realpath; do
     command -v "$c" >/dev/null || die "missing host command: $c"
   done
-  [[ -f $CRED_FILE ]] || die "missing $CRED_FILE (README: Tailnet-separation e2e)"
-  [[ $(stat -c %a -- "$CRED_FILE") == 600 ]] || die "$CRED_FILE must have mode 0600"
-  # shellcheck source=/dev/null
-  . "$CRED_FILE"
-  [[ -n ${TS_E2E_OAUTH_CLIENT_ID:-} && -n ${TS_E2E_OAUTH_CLIENT_SECRET:-} && -n ${TS_E2E_TAILNET:-} ]] ||
-    die "$CRED_FILE must set TS_E2E_OAUTH_CLIENT_ID, TS_E2E_OAUTH_CLIENT_SECRET and TS_E2E_TAILNET"
 
   timeout "$STEP_TIMEOUT" argus session ls --json >/dev/null 2>&1 || die "the Argus node does not answer"
   [[ $(timeout "$STEP_TIMEOUT" argus profile ls 2>/dev/null | awk -v p="$PROFILE" '$1 == p { print $2 }') == docker ]] ||
     die "$PROFILE is not a dockerized Argus profile"
   COMPOSE_FILE=$(find_compose_file "$PROFILE_DIR") || die "no compose file in $PROFILE_DIR"
+  CONFIG_JSON=$(compose config --format json 2>/dev/null) || die "docker compose config failed for $COMPOSE_FILE"
+  jq -e '.services.netguard and .services.agent' >/dev/null <<<"$CONFIG_JSON" ||
+    die "$COMPOSE_FILE needs a netguard and an agent service"
+  GUARD_PREFIXES=$(jq -r --arg d "$DEFAULT_GUARD_PREFIXES" '.services.netguard.environment.NETGUARD_TAILNET_PREFIXES // $d' <<<"$CONFIG_JSON")
+  jq -e '(.services.netguard.environment.NETGUARD_TS_OPERATOR // "") != ""' >/dev/null <<<"$CONFIG_JSON" ||
+    die "netguard does not set NETGUARD_TS_OPERATOR, so the agent cannot run tailscale up"
+  PROXY_PORT=$(proxy_port "$CONFIG_JSON") || die "netguard does not publish port 1055 on 127.0.0.1"
+  KEY_FILE=$(authkey_file "$CONFIG_JSON") || die "the agent does not mount a compose secret named authkey"
+  [[ -f $KEY_FILE && -r $KEY_FILE ]] || die "the authkey secret's file $KEY_FILE is missing or unreadable"
+  [[ -n $(find "$KEY_FILE" -prune -perm 600) ]] || die "$KEY_FILE must have mode 0600"
 
   HOST_STATUS=$(timeout "$API_DEADLINE" tailscale status --json 2>/dev/null) || die "host tailscale status failed"
   [[ $(jq -r .BackendState <<<"$HOST_STATUS") == Running ]] || die "the host is not connected to its tailnet"
   HOST_TAILNET=$(jq -r '.CurrentTailnet.Name // empty' <<<"$HOST_STATUS")
   [[ -n $HOST_TAILNET ]] || die "cannot read the host's tailnet name"
-  [[ $HOST_TAILNET != "$TS_E2E_TAILNET" ]] || die "the host is on the test tailnet $TS_E2E_TAILNET"
-  HOST_TS_IP=$(jq -r '[.Self.TailscaleIPs[]? | select(test("^[0-9.]+$"))][0] // empty' <<<"$HOST_STATUS")
-  HOST_DNS=$(jq -r '(.Self.DNSName // "") | rtrimstr(".")' <<<"$HOST_STATUS")
   HOST_DNS_SUFFIX=$(jq -r '.CurrentTailnet.MagicDNSSuffix // .MagicDNSSuffix // empty' <<<"$HOST_STATUS")
   HOST_IPS_JSON=$(jq -c '[.Self.TailscaleIPs[]?, .Peer[]?.TailscaleIPs[]?]' <<<"$HOST_STATUS")
-  [[ -n $HOST_TS_IP && -n $HOST_DNS && -n $HOST_DNS_SUFFIX ]] || die "cannot read the host's tailnet IP or MagicDNS name"
-  log "host tailnet $HOST_TAILNET: $HOST_DNS ($HOST_TS_IP)"
+  [[ -n $HOST_DNS_SUFFIX ]] || die "cannot read the host's MagicDNS suffix"
+  jq -e --arg ip "$HOST_PEER" 'any(.Peer[]?.TailscaleIPs[]?; . == $ip)' >/dev/null <<<"$HOST_STATUS" ||
+    die "--host-peer $HOST_PEER is not a peer on the host's tailnet"
+  log "host tailnet $HOST_TAILNET; host peer $HOST_PEER; proxy 127.0.0.1:$PROXY_PORT"
 
-  GUARD_PREFIXES=$(guard_prefixes) || die "cannot read NETGUARD_TAILNET_PREFIXES from $COMPOSE_FILE (is there a netguard service?)"
-  uncovered=$(ip -4 route show table 52 | uncovered_routes "$GUARD_PREFIXES") ||
-    die "cannot inspect the host's Tailscale routes (ip route table 52)"
+  # Without the prefs (an older CLI), assume the host accepts subnet routes.
+  route_all=$(timeout "$API_DEADLINE" tailscale debug prefs 2>/dev/null | jq -r '.RouteAll | values' 2>/dev/null)
+  host_routes_list=$(host_routes "$HOST_STATUS" "${route_all:-true}") || die "cannot read the host's tailnet routes"
+  uncovered=$(uncovered_routes "$GUARD_PREFIXES" <<<"$host_routes_list")
   [[ -z $uncovered ]] ||
-    die "host Tailscale routes not covered by NETGUARD_TAILNET_PREFIXES=$GUARD_PREFIXES: $(tr '\n' ' ' <<<"$uncovered")"
+    die "host tailnet routes not covered by NETGUARD_TAILNET_PREFIXES=$GUARD_PREFIXES: $(tr '\n' ' ' <<<"$uncovered")"
 
   services=$(compose ps --status running --services) || die "cannot read the profile's stack state"
-  if grep -qx agent <<<"$services"; then
+  if grep -qx netguard <<<"$services"; then
     STACK_WAS_UP=1
-    st=$(compose exec -T agent tailscale status --json 2>/dev/null)
-    case $(classify_login "$st" "$TS_E2E_TAILNET") in
-      logged-out) ;;
-      e2e) ABANDONED_LOGIN=1 ;;
-      *) die "the profile is logged in to a tailnet this e2e does not own; log it out first (tailscale logout)" ;;
-    esac
-  else
-    case $(state_file_login "$PROFILE_DIR/.tailscale/tailscaled.state") in
-      logged-out) ;;
-      logged-in) die "the stopped profile has a saved Tailscale login; start it and run tailscale logout first" ;;
-      *) die "cannot read $PROFILE_DIR/.tailscale/tailscaled.state" ;;
-    esac
   fi
   log "stack was $( ((STACK_WAS_UP)) && echo up || echo down ) before the test"
 }
 
-# recover: clean up after earlier crashed runs.
+# login_settled: tailscaled has loaded any saved login. Sets LOGIN_STATUS.
+login_settled() {
+  LOGIN_STATUS=$(netguard_status) &&
+    jq -e '.BackendState != "NoState" and .BackendState != "Starting"' >/dev/null <<<"$LOGIN_STATUS"
+}
+
+# recover: bring the stack up, refuse a login this e2e does not own, and clean
+# up after earlier crashed runs. tailscaled's state is root's, so its login is
+# read from the running daemon; teardown stops a stack that was down.
 recover() {
-  local sessions id name dir names n
-  if ((ABANDONED_LOGIN)); then
-    log "logging out a login left by an earlier e2e run"
-    OWN_LOGIN=1
-    logout_owned_login || die "could not log out the abandoned e2e login"
-  fi
-  sessions=$(timeout "$STEP_TIMEOUT" argus session ls --json | jq -r '.sessions[] | [.id, .name] | @tsv') ||
-    die "listing Argus sessions failed"
-  while IFS=$'\t' read -r id name; do
-    is_run_name "$name" || continue
-    log "deleting leftover session $name ($id)"
-    timeout "$STEP_TIMEOUT" argus session rm "$id" --force --delete-branch >/dev/null 2>&1 ||
-      timeout "$STEP_TIMEOUT" argus session rm "$id" --force >/dev/null ||
-      die "could not delete leftover session $id"
-  done <<<"$sessions"
-  for dir in "$STATE_DIR"/tmp/argus-e2e-*; do
-    if is_run_name "${dir##*/}"; then rm -rf -- "$dir"; fi
+  local projects p
+  log "bringing the profile's stack up through Argus"
+  in_stack -t "$STACK_TIMEOUT" true || die "argus profile exec --compose failed: $OUT"
+  wait_until "$DEADLINE" login_settled || die "tailscaled never loaded its state: $LOGIN_STATUS"
+  case $(classify_login "$LOGIN_STATUS" "$HOST_TAILNET") in
+    logged-out) ;;
+    e2e)
+      log "logging out a login left by an earlier e2e run"
+      OWN_LOGIN=1
+      logout_owned_login || die "could not log out the abandoned e2e login"
+      ;;
+    *) die "the profile is logged in to a tailnet this e2e does not own; log it out first (tailscale logout)" ;;
+  esac
+  projects=$(timeout "$STEP_TIMEOUT" docker compose ls -a --format json | jq -r '.[].Name') ||
+    die "listing compose projects failed"
+  local leftovers=()
+  for p in $projects; do
+    is_target_project "$p" && leftovers+=("$p")
   done
-  names=$(timeout "$STEP_TIMEOUT" docker ps -a --filter 'name=^argus-e2e-target-' --format '{{.Names}}') ||
-    die "listing containers failed"
-  for n in $names; do
-    log "removing leftover container $n"
-    timeout "$STEP_TIMEOUT" docker rm -f "$n" >/dev/null || die "could not remove $n"
-  done
-  delete_e2e_devices || die "sweeping leftover argus-e2e devices failed"
+  remove_leftover_targets "${leftovers[@]}" || die "could not remove a leftover target project"
 }
 
-# start_probe_listener: listen on the host's tailnet IP and answer every
-# connection with an HTTP response carrying NONCE, so a probe that reaches it
-# is recognizable whatever the path.
-start_probe_listener() {
-  local portfile
-  portfile=$(mktemp) || return 1
-  timeout 900 python3 -c '
-import socket, sys
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((sys.argv[1], 0))
-s.listen(8)
-print(s.getsockname()[1], flush=True)
-body = sys.argv[2].encode()
-resp = b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
-while True:
-    c = s.accept()[0]
-    try:
-        c.settimeout(5)
-        c.recv(4096)
-        c.sendall(resp)
-    except OSError:
-        pass
-    c.close()' "$HOST_TS_IP" "$NONCE" >"$portfile" 2>/dev/null &
-  PROBE_PID=$!
-  wait_until 10 test -s "$portfile"
-  PROBE_PORT=$(head -n1 "$portfile")
-  rm -f -- "$portfile"
-  [[ -n $PROBE_PORT ]]
-}
-
-# choose_probe: start the probe listener on the host's tailnet IP, and pick
-# one host-tailnet peer that answers tailscale ping, if any.
-choose_probe() {
-  local ip
-  start_probe_listener || die "starting the probe listener on $HOST_TS_IP failed"
-  log "A4 probe: $HOST_TS_IP:$PROBE_PORT"
-  for ip in $(jq -r '.Peer[]? | select(.Online) | .TailscaleIPs[]? | select(test("^[0-9.]+$"))' <<<"$HOST_STATUS" | head -n 3); do
-    if timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$ip" >/dev/null 2>&1; then
-      PEER_IP=$ip
-      break
-    fi
+# remove_leftover_targets PROJECT...: remove target projects left by earlier
+# runs. A node whose container has exited can't be logged out; its key is
+# ephemeral, so the tailnet removes it once it is offline. Fails only when a
+# project can't be removed.
+remove_leftover_targets() {
+  local p
+  for p in "$@"; do
+    log "removing leftover target project $p"
+    compose_target "$p" exec -T node tailscale logout >/dev/null 2>&1 ||
+      log "could not log $p's node out; removing the project anyway"
+    compose_target "$p" down -v -t 1 --remove-orphans >/dev/null || return 1
   done
-  log "A4 peer: ${PEER_IP:-none answering}"
 }
 
 target_ready() {
-  [[ $(timeout "$API_DEADLINE" docker exec "$TARGET" tailscale status --json 2>/dev/null | jq -r '.BackendState // empty') == Running ]] &&
-    [[ $(timeout "$API_DEADLINE" docker exec "$TARGET" curl -fsS --max-time 5 http://localhost:8080/ 2>/dev/null) == "$NONCE" ]]
+  local st
+  st=$(compose_target "$TARGET_PROJECT" exec -T node tailscale status --json 2>/dev/null) || return 1
+  [[ $(jq -r '.BackendState // empty' <<<"$st") == Running ]] || return 1
+  [[ $(compose_target "$TARGET_PROJECT" exec -T node curl -fsS --max-time 5 http://localhost:8080/ 2>/dev/null) == "$NONCE" ]] || return 1
+  compose_target "$TARGET_PROJECT" exec -T postgres pg_isready -q -h 127.0.0.1 >/dev/null 2>&1 || return 1
+  TARGET_IP=$(jq -r '[.Self.TailscaleIPs[]? | select(test("^[0-9.]+$"))][0] // empty' <<<"$st")
+  # Stale nodes can hold the bare hostname, so read the name the node got.
+  TARGET_NAME=$(jq -r '(.Self.DNSName // "") | split(".")[0]' <<<"$st")
+  [[ -n $TARGET_IP && -n $TARGET_NAME ]]
 }
 
 start_target() {
-  log "starting target $TARGET"
-  KEY_DIR=$(mktemp -d) || return 1
-  mint_key "$KEY_DIR/authkey" || { log "minting the target's auth key failed"; return 1; }
+  log "starting target project $TARGET_PROJECT"
   TARGET_STARTED=1
-  timeout 600 docker run -d --name "$TARGET" \
-    -v "$REPO_ROOT/e2e/target:/e2e:ro" -v "$KEY_DIR:/run/e2e:ro" \
-    -e NONCE -e RUN_ID --entrypoint /e2e/run.sh "$IMAGE" >/dev/null ||
-    { log "docker run failed"; return 1; }
+  # The first start may pull the images.
+  OUT=$(compose_target -t "$STACK_TIMEOUT" "$TARGET_PROJECT" up -d 2>&1) || {
+    log "docker compose up for the target failed: $OUT"
+    return 1
+  }
   if ! wait_until "$DEADLINE" target_ready; then
-    log "the target never reported Running and served the nonce; its last log lines:"
-    timeout "$API_DEADLINE" docker logs --tail 30 "$TARGET" >&2
+    log "the target never reported Running and served the nonce and PostgreSQL; its last log lines:"
+    compose_target "$TARGET_PROJECT" logs --tail 30 >&2
     return 1
   fi
-  rm -rf -- "$KEY_DIR"
-  KEY_DIR=""
-}
-
-# agent_exec [-t SECONDS] CMD: type CMD into the e2e session's shell and wait
-# for it to finish. Sets AGENT_OUT to what CMD printed and returns CMD's exit
-# status. Returns 124 when the END marker does not appear in time (AGENT_OUT
-# then holds the tail of the pane) and 125 when sending fails. Every "run
-# inside the agent" call goes through here, so a future Argus-free variant can
-# swap in `docker compose exec`. Call it directly, not inside $(...): the
-# command counter must survive between calls.
-AGENT_SEQ=0
-AGENT_OUT=""
-agent_exec() {
-  local deadline=$DEADLINE cmd id line pane="" result rc end
-  if [[ $1 == -t ]]; then
-    deadline=$2
-    shift 2
+  if jq -e --arg ip "$TARGET_IP" 'any(.[]; . == $ip)' >/dev/null <<<"$HOST_IPS_JSON"; then
+    log "the target got $TARGET_IP, which a host-tailnet node also has; rerun"
+    return 1
   fi
-  cmd=$1
-  AGENT_SEQ=$((AGENT_SEQ + 1))
-  id=$RUN_ID-$AGENT_SEQ-$SRANDOM
-  # The markers are assembled by printf in the session, so the echoed command
-  # line never contains the literal ARGUS-E2E:END:<id> text.
-  line="printf '%s:%s:%s\n' ARGUS-E2E BEGIN $id; $cmd; printf '%s:%s:%s:rc=%d\n' ARGUS-E2E END $id \$?"
-  AGENT_OUT=""
-  if ! timeout "$STEP_TIMEOUT" argus session send "$SESSION" "$line" --enter >/dev/null 2>&1; then
-    AGENT_OUT="argus session send failed"
-    return 125
-  fi
-  end=$((SECONDS + deadline))
-  while ((SECONDS < end)); do
-    pane=$(timeout "$STEP_TIMEOUT" argus session peek "$SESSION" --all 2>/dev/null | strip_ctrl)
-    if result=$(marker_result "$id" <<<"$pane"); then
-      rc=${result%%$'\n'*}
-      AGENT_OUT=${result#*$'\n'}
-      return "${rc#rc=}"
-    fi
-    sleep 1
-  done
-  AGENT_OUT="timed out after ${deadline}s; last pane lines:"$'\n'$(tail -n 20 <<<"$pane")
-  return 124
-}
-
-# wait_shell_ready: type a harmless marker command every 5 seconds until one
-# shows up in the pane, which proves the shell is reading input.
-wait_shell_ready() {
-  local n=0 end=$((SECONDS + DEADLINE)) i
-  while ((SECONDS < end)); do
-    n=$((n + 1))
-    timeout "$STEP_TIMEOUT" argus session send "$SESSION" "printf '%s:%s\n' ARGUS-E2E READY-$RUN_ID-$n" --enter >/dev/null 2>&1
-    for i in 1 2 3 4 5; do
-      sleep 1
-      if timeout "$STEP_TIMEOUT" argus session peek "$SESSION" --all 2>/dev/null | strip_ctrl |
-        grep -q "^ARGUS-E2E:READY-$RUN_ID-"; then
-        return 0
-      fi
-    done
-  done
-  return 1
+  log "target $TARGET_NAME ($TARGET_IP)"
 }
 
 daemon_needs_login() {
-  agent_exec -t "$API_DEADLINE" 'tailscale status --json | jq -e ".BackendState == \"NeedsLogin\"" >/dev/null'
+  in_stack -t "$API_DEADLINE" 'tailscale status --json | jq -e ".BackendState == \"NeedsLogin\"" >/dev/null'
 }
 
 agent_logged_in() {
-  # shellcheck disable=SC2016 # expands in the session's shell
-  agent_exec -t "$API_DEADLINE" "$(tmpl 'tailscale status --json | jq -e --arg h @H@ ".Self.HostName == \$h and .BackendState == \"Running\"" >/dev/null' H "$AGENT_HOST")"
+  # shellcheck disable=SC2016 # expands in the agent
+  in_stack -t "$API_DEADLINE" "$(tmpl 'tailscale status --json | jq -e --arg h @H@ ".Self.HostName == \$h and .BackendState == \"Running\"" >/dev/null' H "$AGENT_HOST")"
 }
 
 start_agent() {
-  local rc
-  log "creating session $SESSION in profile $PROFILE"
-  REPO_CREATED=1
-  # shellcheck disable=SC2015 # the fallback runs when any step fails, as intended
-  mkdir -p "$REPO_DIR" &&
-    git -C "$REPO_DIR" init -q -b main &&
-    git -C "$REPO_DIR" -c user.name=argus-e2e -c user.email=argus-e2e@localhost commit -q --allow-empty -m "argus e2e $RUN_ID" ||
-    { log "creating the throwaway repo failed"; return 1; }
-  SESSION_CREATED=1
-  # A shell session brings the stack up lazily through the real Argus path.
-  timeout 600 argus session new "$SESSION" --provider shell --profile "$PROFILE" --src "$REPO_DIR" --branch "$SESSION" >/dev/null ||
-    { log "argus session new failed"; return 1; }
-
-  wait_shell_ready || { log "the session shell never answered"; return 1; }
-  # The image's SHELL makes the session a zsh login shell.
-  # shellcheck disable=SC2016 # expands in the session's shell
-  agent_exec 'test -n "$ZSH_VERSION"' || { log "the session shell is not zsh: $AGENT_OUT"; return 1; }
-  # oh-my-zsh's url-quote-magic (run on pasted text by bracketed-paste-magic)
-  # escapes characters that follow a URL, so `curl http://h/; rc=$?` reaches
-  # the shell as `curl http://h/\; rc=$?`. Restore zsh's builtin widgets so
-  # every command runs exactly as sent.
-  agent_exec 'zle -A .self-insert self-insert && zle -A .bracketed-paste bracketed-paste' ||
-    { log "restoring zsh's builtin line-editor widgets failed: $AGENT_OUT"; return 1; }
   wait_until "$DEADLINE" daemon_needs_login ||
-    { log "tailscaled in the session never reported NeedsLogin: $AGENT_OUT"; return 1; }
-
-  mint_key "$AGENT_KEY" || { log "minting the agent's auth key failed"; return 1; }
-  # From here on, any login in the profile is this run's: preflight saw it
-  # logged out, or recovered the abandoned e2e login.
+    { log "tailscaled never reported NeedsLogin: $OUT"; return 1; }
+  # From here on, any login in the profile is this run's: recover saw it
+  # logged out, or logged out the abandoned e2e login.
   OWN_LOGIN=1
-  log "enrolling $AGENT_HOST"
-  agent_exec "timeout -k 5 45 tailscale up --auth-key=file:/var/lib/tailscale/e2e-authkey --hostname=$AGENT_HOST"
-  rc=$?
-  rm -f -- "$AGENT_KEY"
-  ((rc == 0)) || { log "tailscale up failed (rc=$rc): $AGENT_OUT"; return 1; }
-  wait_until "$DEADLINE" agent_logged_in || { log "the agent never came up as $AGENT_HOST: $AGENT_OUT"; return 1; }
+  log "enrolling $AGENT_HOST from the agent"
+  in_stack -t 60 "timeout -k 5 45 tailscale up --auth-key=file:/run/secrets/authkey --hostname=$AGENT_HOST" ||
+    { log "tailscale up from the agent failed: $OUT"; return 1; }
+  wait_until "$DEADLINE" agent_logged_in || { log "the agent never came up as $AGENT_HOST: $OUT"; return 1; }
 }
 
 ASSERT_FAILED=0
@@ -586,14 +534,26 @@ assert() {
   fi
 }
 
-# in_agent LABEL CMD: one step of an assertion, run in the session. On failure
-# its label, status and output go into CHECK_OUT.
-in_agent() {
+# stack_step LABEL CMD: one step of an assertion, run in the agent. On
+# failure its label, status and output go into CHECK_OUT.
+stack_step() {
   local rc
-  agent_exec "$2"
+  in_stack "$2"
   rc=$?
   if ((rc != 0)); then
-    CHECK_OUT+="$1 (rc=$rc):"$'\n'"$AGENT_OUT"$'\n'
+    CHECK_OUT+="$1 (rc=$rc):"$'\n'"$OUT"$'\n'
+    return 1
+  fi
+}
+
+# hooked_step LABEL CMD: one step of an assertion, run on the host in the
+# profile's environment.
+hooked_step() {
+  local rc
+  on_host_hooked "$2"
+  rc=$?
+  if ((rc != 0)); then
+    CHECK_OUT+="$1 (rc=$rc):"$'\n'"$OUT"$'\n'
     return 1
   fi
 }
@@ -610,58 +570,179 @@ on_host() {
   fi
 }
 
-# shellcheck disable=SC2016 # these commands expand in the session's shell
-a1_joined_test_tailnet() {
-  in_agent "tailnet name" "$(tmpl 'n=$(tailscale status --json | jq -r ".CurrentTailnet.Name // empty"); printf "tailnet=%s\n" "$n"; [ "$n" = @WANT@ ] && [ "$n" != @HOST@ ]' \
-    WANT "$(q "$TS_E2E_TAILNET")" HOST "$(q "$HOST_TAILNET")")"
+# expect_rc WANT CMD...: succeed when CMD exits WANT, printing its output.
+expect_rc() {
+  local want=$1 rc
+  shift
+  "$@"
+  rc=$?
+  ((rc == want)) || {
+    echo "exit $rc, want $want"
+    return 1
+  }
 }
 
-a2_peer_ping() {
-  # --until-direct defaults to true, which fails a working DERP-relayed path.
-  in_agent "tailscale ping $TARGET" "timeout 40 tailscale ping --until-direct=false -c 3 --timeout 10s $TARGET"
-}
+probe() { python3 -I -c "$PROBE" "$@"; }
 
-# shellcheck disable=SC2016 # these commands expand in the session's shell
-a3_proxy_http() {
-  in_agent "curl http://$TARGET:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
-}
-
-host_gets_nonce() {
-  [[ $(curl -sS --noproxy '*' --max-time 5 "http://$HOST_TS_IP:$PROBE_PORT/") == "$NONCE" ]]
-}
-
-# shellcheck disable=SC2016 # these commands expand in the session's shell
-a4_no_host_tailnet() {
+# shellcheck disable=SC2016 # these commands expand in the agent
+a1_joined_as_operator() {
   local failed=0
-  local py='import errno, socket, sys; s = socket.socket(); s.settimeout(5); r = s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(errno.errorcode.get(r, r)); sys.exit(0 if r in (errno.EHOSTUNREACH, errno.ENETUNREACH) else 1)'
-
-  # Positive controls from the host, immediately before: the targets are there.
-  on_host "control: host gets the nonce from $HOST_TS_IP:$PROBE_PORT" host_gets_nonce || failed=1
-  if [[ -n $PEER_IP ]]; then
-    on_host "control: host pings $PEER_IP" timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$PEER_IP" || failed=1
-  fi
-
-  # Through Tailscale.
-  in_agent "no host-tailnet peers in tailscale status" "$(tmpl 'tailscale status --json | jq -e --argjson bad @BAD@ --arg sfx @SFX@ "[.Peer[]? | select(any(.TailscaleIPs[]?; . as \$i | any(\$bad[]; . == \$i)) or ((.DNSName // \"\") | endswith(\$sfx)))] | length == 0" >/dev/null || { tailscale status --json | jq -r ".Peer[]? | .DNSName"; false; }' \
-    BAD "$(q "$HOST_IPS_JSON")" SFX "$(q ".$HOST_DNS_SUFFIX.")")" || failed=1
-  in_agent "tailscale ping $HOST_TS_IP fails" "if timeout 20 tailscale ping -c 1 --timeout 5s $HOST_TS_IP; then echo unexpected-pong; false; else true; fi" || failed=1
-  in_agent "curl http://$HOST_DNS:$PROBE_PORT/ does not reach the host" "$(tmpl 'r=$(curl -sS --max-time 5 http://@D@:@P@/); printf "rc=%s got=%s\n" "$?" "$r"; [ "$r" != @N@ ]' D "$HOST_DNS" P "$PROBE_PORT" N "$NONCE")" || failed=1
-
-  # Direct path: no proxy, the kernel route must refuse with EHOSTUNREACH or
-  # ENETUNREACH (not a timeout or a refusal).
-  in_agent "direct connect to $HOST_TS_IP:$PROBE_PORT is unreachable" "python3 -c $(q "$py") $HOST_TS_IP $PROBE_PORT" || failed=1
-  if [[ -n $PEER_IP ]]; then
-    in_agent "direct connect to $PEER_IP:$PROBE_PORT is unreachable" "python3 -c $(q "$py") $PEER_IP $PROBE_PORT" || failed=1
-  fi
-  # Every interface, not just conf/all: a per-interface setting can differ.
-  in_agent "IPv6 is disabled on every interface" 'if grep -qx 0 /proc/sys/net/ipv6/conf/*/disable_ipv6; then grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6; false; fi' || failed=1
-  in_agent "ip route get $HOST_TS_IP is unreachable" "$(tmpl 'out=$(ip route get @IP@ 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qiE "unreachable|no route to host"' IP "$HOST_TS_IP")" || failed=1
+  stack_step "the agent runs as the host's uid" "$(tmpl 'u=$(id -u); printf "uid=%s\n" "$u"; [ "$u" = @U@ ]' U "$(id -u)")" || failed=1
+  stack_step "joined $AGENT_HOST on a tailnet other than the host's" "$(tmpl 's=$(tailscale status --json); printf "%s\n" "$s" | jq -c "{BackendState, tailnet: .CurrentTailnet.Name, host: .Self.HostName}"; printf "%s\n" "$s" | jq -e --arg h @H@ --arg host_tn @TN@ ".BackendState == \"Running\" and .Self.HostName == \$h and (.CurrentTailnet.Name // \"\") != \"\" and .CurrentTailnet.Name != \$host_tn" >/dev/null' \
+    H "$AGENT_HOST" TN "$(q "$HOST_TAILNET")")" || failed=1
+  stack_step "tailscale set works from the agent" 'tailscale set --accept-routes=false' || failed=1
+  on_host "netguard has exactly NET_ADMIN" netguard_caps || failed=1
+  stack_step "no firewall health warnings" 'h=$(tailscale status --json | jq -r ".Health[]?"); printf "%s\n" "$h"; ! printf "%s\n" "$h" | grep -qiE "firewall|netfilter|iptables|nftables"' || failed=1
   return "$failed"
 }
 
-# shellcheck disable=SC2016 # these commands expand in the session's shell
-a5_internet_egress() {
-  in_agent "https://api.tailscale.com/ answers" 'code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 https://api.tailscale.com/); printf "http=%s\n" "$code"; [ -n "$code" ] && [ "$code" != 000 ]'
+# shellcheck disable=SC2016 # these commands expand in the agent
+a2_agent_reaches_peer() {
+  local failed=0 h
+  # CAP_NET_ADMIN is bit 12. Without it in the bounding set, no process in
+  # the agent can gain it, root or not.
+  stack_step "the agent lacks NET_ADMIN" 'for f in CapEff CapBnd; do c=$(awk -v f="$f:" "\$1 == f {print \$2}" /proc/self/status); printf "%s=%s\n" "$f" "$c"; [ -n "$c" ] && [ $(( (0x$c >> 12) & 1 )) -eq 0 ] || exit 1; done' || failed=1
+  stack_step "the agent has no proxy variables" 'v=$(env | grep -iE "^(all|http|https)_proxy="); printf "%s\n" "$v"; [ -z "$v" ]' || failed=1
+  for h in "$TARGET_IP" "$TARGET_NAME"; do
+    stack_step "psql to $h" "$(tmpl 'r=$(PGCONNECT_TIMEOUT=10 psql -h @H@ -U postgres -tAc "select 1"); printf "got=%s\n" "$r"; [ "$r" = 1 ]' H "$h")" || failed=1
+    stack_step "nc to $h:5432" "nc -z -w 10 $h 5432" || failed=1
+    stack_step "ping $h" "ping -c 2 -W 5 $h" || failed=1
+    stack_step "curl http://$h:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@H@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' H "$h" N "$NONCE")" || failed=1
+  done
+  return "$failed"
+}
+
+# Positive controls from the host, immediately before each negative probe:
+# the host peer is there and answers.
+host_peer_controls() {
+  local failed=0
+  on_host "control: the host connects to $HOST_PEER:$HOST_PEER_PORT" probe connect "$HOST_PEER" "$HOST_PEER_PORT" || failed=1
+  on_host "control: the host pings $HOST_PEER over its tailnet" \
+    timeout 20 tailscale ping --until-direct=false -c 1 --timeout 5s "$HOST_PEER" || failed=1
+  return "$failed"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the agent
+a3_agent_no_host_tailnet() {
+  local failed=0
+  host_peer_controls || failed=1
+  stack_step "ip route get $HOST_PEER is unreachable" "$(tmpl 'out=$(ip route get @IP@ 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qiE "unreachable|no route to host"' IP "$HOST_PEER")" || failed=1
+  stack_step "direct connect to $HOST_PEER:$HOST_PEER_PORT is unreachable" "python3 -I -c $(q "$PROBE") unreachable $HOST_PEER $HOST_PEER_PORT" || failed=1
+  stack_step "ping $HOST_PEER fails" "if ping -c 1 -W 3 $HOST_PEER; then echo unexpected-reply; false; else true; fi" || failed=1
+  stack_step "tailscale ping $HOST_PEER fails" "if timeout 20 tailscale ping -c 1 --timeout 5s $HOST_PEER; then echo unexpected-pong; false; else true; fi" || failed=1
+  stack_step "no host-tailnet peers in tailscale status" "$(tmpl 'tailscale status --json | jq -e --argjson bad @BAD@ --arg sfx @SFX@ "[.Peer[]? | select(any(.TailscaleIPs[]?; . as \$i | any(\$bad[]; . == \$i)) or ((.DNSName // \"\") | endswith(\$sfx)))] | length == 0" >/dev/null || { tailscale status --json | jq -r ".Peer[]? | .DNSName"; false; }' \
+    BAD "$(q "$HOST_IPS_JSON")" SFX "$(q ".$HOST_DNS_SUFFIX.")")" || failed=1
+  # Every interface, not just conf/all: a per-interface setting can differ.
+  stack_step "IPv6 is disabled on every interface" 'if grep -qx 0 /proc/sys/net/ipv6/conf/*/disable_ipv6; then grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6; false; fi' || failed=1
+  return "$failed"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the agent
+a4_agent_internet() {
+  stack_step "https://api.tailscale.com/ answers" 'code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 https://api.tailscale.com/); printf "http=%s\n" "$code"; [ -n "$code" ] && [ "$code" != 000 ]'
+}
+
+host_curl_nonce() {
+  local got
+  got=$(curl -fsS --max-time 15 "$@") || return 1
+  [[ $got == "$NONCE" ]] || {
+    echo "got=$got"
+    return 1
+  }
+}
+
+host_curl_status() {
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$@")
+  echo "http=$code"
+  [[ $code =~ ^[23] ]]
+}
+
+a5_host_proxy_reaches_peer() {
+  local failed=0 h px=127.0.0.1:$PROXY_PORT
+  for h in "$TARGET_NAME" "$TARGET_IP"; do
+    on_host "HTTP proxy to http://$h:8080/" host_curl_nonce -x "http://$px" "http://$h:8080/" || failed=1
+    on_host "SOCKS5 proxy to http://$h:8080/" host_curl_nonce --socks5-hostname "$px" "http://$h:8080/" || failed=1
+  done
+  on_host "HTTP proxy to https://github.com" host_curl_status -x "http://$px" https://github.com || failed=1
+  return "$failed"
+}
+
+a6_host_proxy_no_host_tailnet() {
+  local failed=0
+  host_peer_controls || failed=1
+  on_host "SOCKS5 CONNECT to $HOST_PEER:$HOST_PEER_PORT is refused" expect_rc 1 probe socks "$HOST_PEER" "$HOST_PEER_PORT" "$PROXY_PORT" || failed=1
+  on_host "HTTP CONNECT to $HOST_PEER:$HOST_PEER_PORT is refused" expect_rc 1 probe http "$HOST_PEER" "$HOST_PEER_PORT" "$PROXY_PORT" || failed=1
+  return "$failed"
+}
+
+# shellcheck disable=SC2016 # these commands expand in the hooked host shell
+a7_hook_points_at_proxy() {
+  local failed=0
+  hooked_step "the hook exports the proxy variables" "$(tmpl 'n=$(env | grep -cxE "(ALL|all|HTTP|http|HTTPS|https)_PROXY=http://127\.0\.0\.1:@P@|(ALL|all|HTTP|http|HTTPS|https)_proxy=http://127\.0\.0\.1:@P@"); printf "proxy_vars=%s\n" "$n"; [ "$n" -eq 6 ] && env | grep -qx "NO_PROXY=localhost,127.0.0.1,::1"' P "$PROXY_PORT")" || failed=1
+  hooked_step "curl http://$TARGET_NAME:8080/ with the hook's environment" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET_NAME" N "$NONCE")" || failed=1
+  return "$failed"
+}
+
+node_id() {
+  netguard_status | jq -er '.Self.ID // empty'
+}
+
+# agent_reaches_target: the agent reaches the target over the tailnet.
+agent_reaches_target() {
+  # shellcheck disable=SC2016 # expands in the agent
+  in_stack "$(tmpl 'r=$(curl -fsS --max-time 10 http://@T@:8080/) && [ "$r" = @N@ ]' T "$TARGET_IP" N "$NONCE")"
+}
+
+# same_node_after LABEL ID: after a restart or recreate, netguard is healthy,
+# still the node ID, and the agent reaches the target again.
+same_node_after() {
+  local id
+  if ! wait_until "$DEADLINE" netguard_healthy; then
+    CHECK_OUT+="$1: netguard never became healthy"$'\n'
+    return 1
+  fi
+  id=$(node_id)
+  if [[ $id != "$2" ]]; then
+    CHECK_OUT+="$1: node ID is ${id:-unreadable}, was $2"$'\n'
+    return 1
+  fi
+  if ! wait_until "$DEADLINE" agent_reaches_target; then
+    CHECK_OUT+="$1: the agent does not reach the target: $OUT"$'\n'
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2016 # these commands expand in the agent
+a8_identity_and_restart() {
+  local failed=0 id
+  id=$(node_id) || {
+    CHECK_OUT+="cannot read the node ID"$'\n'
+    return 1
+  }
+  if ! compose restart -t 5 netguard >/dev/null 2>&1 || ! wait_until "$DEADLINE" netguard_healthy; then
+    CHECK_OUT+="restarting netguard failed"$'\n'
+    return 1
+  fi
+  # The agent still holds the old namespace: it must fail closed.
+  stack_step "a stranded agent cannot reach the target" "$(tmpl 'if curl -fsS --max-time 5 http://@T@:8080/; then echo reached; false; else true; fi' T "$TARGET_IP")" || failed=1
+  stack_step "a stranded agent has no internet" 'if curl -sS -o /dev/null --max-time 5 https://api.tailscale.com/; then echo reached; false; else true; fi' || failed=1
+  if compose restart -t 5 agent >/dev/null 2>&1; then
+    same_node_after "netguard restart, then agent restart" "$id" || failed=1
+  else
+    CHECK_OUT+="restarting the agent failed"$'\n'
+    failed=1
+  fi
+  # A recreate strands the agent until the next up -d recreates it too,
+  # which is what Argus runs before every exec.
+  if compose -t 120 up -d --no-build --force-recreate netguard >/dev/null 2>&1 &&
+    compose -t 120 up -d --no-build >/dev/null 2>&1; then
+    same_node_after "netguard recreate" "$id" || failed=1
+  else
+    CHECK_OUT+="recreating netguard failed"$'\n'
+    failed=1
+  fi
+  return "$failed"
 }
 
 check_host_status() {
@@ -674,26 +755,20 @@ check_host_status() {
   return 1
 }
 
-a6_host_unaffected() {
+a9_host_unaffected() {
   on_host "host tailscale status" check_host_status
 }
 
-# shellcheck disable=SC2016 # these commands expand in the session's shell
-a7_env_from_hook() {
-  # /proc/$$/environ is the environment Argus started the login shell with,
-  # after the hook and before .zshrc.
-  in_agent "session shell's initial environment" 'e=$(tr "\0" "\n" < /proc/$$/environ); n=$(printf "%s\n" "$e" | grep -cixE "(all|http|https)_proxy=http://localhost:1055"); printf "proxy_vars=%s\n" "$n"; [ "$n" -eq 6 ] && printf "%s\n" "$e" | grep -qx "ARGUS_E2E_POST_CREATE=in-container-sentinel"' || return 1
-  in_agent "curl from zsh -f" "$(tmpl 'r=$(zsh -f -c "curl -fsS --max-time 15 http://@T@:8080/"); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET" N "$NONCE")"
-}
-
 run_assertions() {
-  assert A1 "joined the other tailnet" a1_joined_test_tailnet
-  assert A2 "peer connectivity" a2_peer_ping
-  assert A3 "proxy, MagicDNS and a real service" a3_proxy_http
-  assert A4 "the container cannot reach the host tailnet by any path" a4_no_host_tailnet
-  assert A5 "internet egress still works through the proxy" a5_internet_egress
-  assert A6 "the host is unaffected" a6_host_unaffected
-  assert A7 "the proxy comes from the post_create hook, not .zshrc" a7_env_from_hook
+  assert A1 "the agent joined the other tailnet as the operator" a1_joined_as_operator
+  assert A2 "the agent reaches a client-tailnet peer without NET_ADMIN" a2_agent_reaches_peer
+  assert A3 "the agent cannot reach the host tailnet" a3_agent_no_host_tailnet
+  assert A4 "the agent's internet egress works" a4_agent_internet
+  assert A5 "the host proxy reaches the client tailnet and the internet" a5_host_proxy_reaches_peer
+  assert A6 "the host proxy cannot reach the host tailnet" a6_host_proxy_no_host_tailnet
+  assert A7 "the post_create hook points host-side commands at the proxy" a7_hook_points_at_proxy
+  assert A8 "the node keeps its identity across a netguard restart and recreate" a8_identity_and_restart
+  assert A9 "the host is unaffected" a9_host_unaffected
 }
 
 # td NAME CMD...: run one teardown step. Report a failure and carry on.
@@ -706,23 +781,19 @@ td() {
   fi
 }
 
-# teardown: the EXIT trap. It acts only on what this run recorded as its own.
-# Every command it runs is bounded (STEP_TIMEOUT or API_DEADLINE). Errors are
-# reported but do not change the run's exit status.
+# teardown: the EXIT trap. It acts only on what this run recorded as its own,
+# and logs both nodes out, which removes them because the key is ephemeral.
+# Every command it runs is bounded. Errors are reported but do not change the
+# run's exit status.
 teardown() {
   local rc=$?
-  trap - EXIT INT TERM
+  # Ignore further signals: every step below is bounded, and an interrupted
+  # teardown would leave nodes on the tailnet.
+  trap - EXIT
+  trap '' INT TERM
   log "teardown"
-  ((SESSION_CREATED)) && td "delete session $SESSION" timeout "$STEP_TIMEOUT" argus session rm "$SESSION" --force --delete-branch
-  ((OWN_LOGIN)) && td "log out the e2e login" logout_owned_login
-  # Remove the target before listing devices, so an enrollment still pending
-  # cannot complete after the sweep.
-  ((TARGET_STARTED)) && td "remove $TARGET" timeout "$STEP_TIMEOUT" docker rm -f "$TARGET"
-  [[ -n $TOKEN ]] && td "delete argus-e2e devices" delete_e2e_devices
-  [[ -n $PROBE_PID ]] && td "stop the probe listener" kill "$PROBE_PID"
-  ((REPO_CREATED)) && td "delete $REPO_DIR" rm -rf -- "$REPO_DIR"
-  [[ -n $KEY_DIR ]] && td "delete the target key" rm -rf -- "$KEY_DIR"
-  td "delete the agent key" rm -f -- "$AGENT_KEY"
+  ((OWN_LOGIN)) && td "log out the agent's login" logout_owned_login
+  ((TARGET_STARTED)) && td "log out and remove $TARGET_PROJECT" logout_target "$TARGET_PROJECT"
   ((STACK_WAS_UP)) || td "bring the stack down" timeout "$STEP_TIMEOUT" argus profile down "$PROFILE"
   ((TEARDOWN_ERRORS)) && log "teardown finished with $TEARDOWN_ERRORS error(s)"
   exit "$rc"
@@ -733,12 +804,10 @@ main() {
   init_run
   log "run $RUN_ID: profile $PROFILE, state root $STATE_DIR"
   preflight_checks
-  get_token || die "exchanging the OAuth client for an API token failed"
   trap teardown EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   recover
-  choose_probe
   start_target || die "the target node did not come up"
   start_agent || die "the agent did not join the test tailnet"
   run_assertions

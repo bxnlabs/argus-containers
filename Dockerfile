@@ -26,8 +26,11 @@ ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 RUN mkdir -p ${ARGUS_TOOLS}/bin ${ARGUS_TOOLS}/lib ${ARGUS_TOOLS}/share
 
-# Base development tools. No iptables: userspace Tailscale doesn't touch
-# netfilter. iproute2 is for the network guard. groff-base renders `aws help`.
+# Base development tools. No iptables: tailscaled in netguard runs its
+# firewall in nftables mode, over netlink. iproute2 is for the network guard.
+# groff-base renders `aws help`. iputils-ping, netcat-openbsd and
+# postgresql-client are for raw tailnet traffic from the agent, which routes
+# to the tailnet natively.
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install --no-install-recommends --yes \
@@ -37,10 +40,13 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
         git \
         gnupg \
         groff-base \
+        iputils-ping \
         jq \
         less \
         make \
+        netcat-openbsd \
         openssh-client \
+        postgresql-client \
         procps \
         python3 \
         supervisor \
@@ -52,8 +58,7 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Baked config: supervisor, home bootstrap, network guard, session
-# environment, home skeleton.
+# Baked config: supervisor, home bootstrap, network guard, home skeleton.
 COPY rootfs/ /
 
 ############################
@@ -90,7 +95,8 @@ ARG AGY_BUILD=6662628811079680
 ARG AGY_SHA512_AMD64=7a10134a69c575dc11bdc721322344e9db3bf2c9d890f2d40ff0bffda93d39b6ef1c7c486f491d1ddf08b123deef375c7bbe46b62cd3fbc3cc956b1a3bd22956
 ARG AGY_SHA512_ARM64=a26463715b58b787ef24d377138351b725e980c3dec417faa60ad991c8e676f67c6c83b7158d2ef95569a87ba79d0ef2eb781b6d53ac2dbf991f5443f7a46573
 
-# Tailscale (static binaries: tailscale + tailscaled)
+# Tailscale (static binaries: tailscaled runs in netguard; the tailscale CLI
+# also works from the agent over the shared socket)
 RUN set -eux; \
     case "$TARGETARCH" in \
         amd64) TS_ARCH=amd64 ;; \
@@ -234,7 +240,7 @@ COPY --from=deps ${ARGUS_TOOLS}/ ${ARGUS_TOOLS}/
 # keeps this layer small.
 # Runtime directories for whatever non-root UID a profile adds, sticky and
 # world-writable so no profile needs its own chown. Profiles bind-mount
-# /var/lib/tailscale, which hides this directory and its mode.
+# /var/lib/tailscale on netguard, which hides this directory and its mode.
 RUN set -eux; \
     find "${ARGUS_TOOLS}" -perm /022 ! -type l -exec chmod go-w {} +; \
     mkdir -p /var/run/tailscale /var/lib/tailscale "${ARGUS_TOOLS}/share/supervisor"; \

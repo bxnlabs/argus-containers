@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entrypoint for the e2e target node, run as root in the profile image. Joins
-# the test tailnet with the auth key at /run/e2e/authkey and serves $NONCE on
-# port 8080.
+# the test tailnet with the auth key in the compose secret and serves $NONCE
+# on port 8080.
 set -euo pipefail
 : "${NONCE:?NONCE must be set}" "${RUN_ID:?RUN_ID must be set}"
 
@@ -17,7 +17,7 @@ if [ ! -S "$sock" ]; then
   exit 1
 fi
 
-tailscale up --auth-key=file:/run/e2e/authkey --hostname="argus-e2e-target-$RUN_ID"
+tailscale up --auth-key=file:/run/secrets/authkey --hostname="argus-e2e-target-$RUN_ID"
 
 mkdir -p /srv
 printf '%s' "$NONCE" >/srv/index.html

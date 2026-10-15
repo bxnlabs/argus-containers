@@ -6,11 +6,11 @@ Container images for [Argus](https://github.com/bxnlabs/argus) dockerized profil
 
 A base image with everything a dockerized Argus profile needs:
 
-- Ubuntu 26.04 with a development tool set (build-essential, git, jq, python3, tmux, vim, zsh and more).
-- tailscale and tailscaled (userspace networking), pulumi, gcloud (with gsutil, bq and gke-gcloud-auth-plugin), aws, az, kubectl, helm, k9s and oh-my-zsh.
+- Ubuntu 26.04 with a development tool set (build-essential, git, jq, python3, tmux, vim, zsh and more), plus `psql`, `nc` and `ping` for raw tailnet traffic.
+- tailscale and tailscaled, pulumi, gcloud (with gsutil, bq and gke-gcloud-auth-plugin), aws, az, kubectl, helm, k9s and oh-my-zsh.
 - The agent CLIs Argus supports: `claude`, `codex`, `agy` (Antigravity) and `omp` (oh-my-pi), plus Node.js for the npm-distributed ones.
-- A supervisord configuration that seeds `$HOME` and runs tailscaled. tailscaled serves an HTTP and SOCKS5 proxy on `localhost:1055`.
-- `/opt/argus/bin/netguard.sh`, `/opt/argus/bin/wait-proxy` and `/opt/argus/etc/env.sh`, described below.
+- A supervisord configuration that seeds `$HOME`.
+- `/opt/argus/bin/netguard.sh`, the entrypoint of a profile's `netguard` service. It guards the network and runs tailscaled in TUN mode, with an HTTP and SOCKS5 proxy on port 1055. See [Networking](#networking).
 
 Tools live under `/opt/argus`, which is on `PATH` for every process in the container. The image sets `SHELL=/bin/zsh`, so Argus shell sessions start a zsh login shell.
 
@@ -40,7 +40,8 @@ FROM ghcr.io/bxnlabs/argus-containers/profile:main
 # Host-matching identity: the host's uid, gid, user name and group name. Free
 # each first (ubuntu ships uid/gid 1000 as the `ubuntu` user, and a `staff`
 # group with gid 50). HOME points at the mounted host home (-M: reference the
-# mount, don't create it).
+# mount, don't create it). USER is not set by docker exec; `tailscale up`
+# needs it to keep the user as tailscaled's operator.
 ARG ARGUS_UID
 ARG ARGUS_GID
 ARG ARGUS_USER
@@ -53,7 +54,7 @@ RUN set -eux; \
     if getent group  "$ARGUS_GROUP" >/dev/null; then groupdel "$ARGUS_GROUP"; fi; \
     groupadd -g "$ARGUS_GID" "$ARGUS_GROUP"; \
     useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /usr/bin/zsh "$ARGUS_USER"
-ENV HOME=$ARGUS_HOST_HOME
+ENV HOME=$ARGUS_HOST_HOME USER=$ARGUS_USER
 USER $ARGUS_USER
 ```
 
@@ -70,6 +71,9 @@ x-profile-build: &profile-build
     ARGUS_GROUP: ${ARGUS_GROUP:-argus}
     ARGUS_HOST_HOME: ${ARGUS_HOST_HOME}
 
+volumes:
+  ts-sock:            # tailscaled's socket, shared with the agent
+
 services:
   netguard:
     build: *profile-build
@@ -78,10 +82,20 @@ services:
     entrypoint: ["/opt/argus/bin/netguard.sh"]
     environment:
       NETGUARD_TAILNET_PREFIXES: 100.64.0.0/10
+      NETGUARD_TS_OPERATOR: ${ARGUS_USER:-argus}   # the agent's user may control tailscaled
+      TS_DEBUG_FIREWALL_MODE: nftables             # needs only NET_ADMIN
     cap_drop: [ALL]
     cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
     sysctls:
       net.ipv6.conf.all.disable_ipv6: 1
+      net.ipv4.conf.all.src_valid_mark: 1
+    ports:
+      - "127.0.0.1:10551:1055"   # tailnet proxy for host-side sessions; one port per profile
+    volumes:
+      - ./.tailscale:/var/lib/tailscale   # Tailscale state
+      - ts-sock:/var/run/tailscale
     healthcheck:
       test: ["CMD", "/opt/argus/bin/netguard.sh", "--check"]
       interval: 10s
@@ -100,7 +114,7 @@ services:
       - ./.home:${ARGUS_HOST_HOME}                                  # isolated HOME
       - ${ARGUS_HOST_HOME}/Workspace:${ARGUS_HOST_HOME}/Workspace   # real Workspace
       - ${ARGUS_STATE_DIR}:${ARGUS_STATE_DIR}                       # Argus state root
-      - ./.tailscale:/var/lib/tailscale                             # Tailscale state
+      - ts-sock:/var/run/tailscale                                  # tailscale CLI
     command: ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
 ```
 
@@ -110,22 +124,39 @@ Referencing the shared tag directly would be a problem: any pull of it (another 
 
 Argus passes `ARGUS_HOST_HOME`, `ARGUS_STATE_DIR`, `ARGUS_UID` and `ARGUS_GID` to every compose invocation. It also passes `ARGUS_USER` (the host login name), `ARGUS_GROUP` (the name of the host user's primary group) and `ARGUS_HOSTNAME` (the host's short hostname), so the agent runs as the host's user on a container named like the host. Those three are best-effort: Argus leaves one unset when its lookup fails, and Argus releases before bxnlabs/argus#197 pass none of them, which is what the recipe's defaults are for.
 
-`hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network. It is also the name `tailscale up` registers the container under; pass `--hostname` to register a different one.
+`hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network. It is also the name `tailscale up` registers the profile under; pass `--hostname` to register a different one.
+
+`netguard` runs tailscaled and keeps its state in `.tailscale`. The agent mounts only tailscaled's socket, so the `tailscale` CLI works there. `NETGUARD_TS_OPERATOR` names the user that may change tailscaled's settings without root, which is the agent's user here; leave it unset and only root in `netguard` can, even if an earlier start set an operator. `tailscale up` keeps the operator only when `$USER` names it, which is why the Dockerfile sets `USER`; without it, the first `tailscale up` clears the operator and `netguard` turns unhealthy. Pick a free host port for each profile's proxy (`10551` above).
 
 ### hooks/post_create.sh
 
+Sessions run on the host, and Argus sources this hook in bash before starting an agent, before a shell session's login shell, and for `argus profile exec`. It points the session's HTTP and SOCKS clients at the profile's proxy:
+
 ```sh
-/opt/argus/bin/home-bootstrap.sh >/dev/null 2>&1 || true
-/opt/argus/bin/wait-proxy
-. /opt/argus/etc/env.sh
-echo "[post_create] tailnet traffic goes through tailscaled's proxy on localhost:1055"
+ARGUS_PROXY=http://127.0.0.1:10551   # the port netguard publishes
+export ALL_PROXY=$ARGUS_PROXY all_proxy=$ARGUS_PROXY
+export HTTP_PROXY=$ARGUS_PROXY http_proxy=$ARGUS_PROXY
+export HTTPS_PROXY=$ARGUS_PROXY https_proxy=$ARGUS_PROXY
+export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+unset ARGUS_PROXY
+
+# Argus brings the stack up before the hook runs, but tailscaled can still be
+# starting. Any HTTP answer means its proxy is up; a bare connect proves
+# nothing, because Docker's port proxy accepts before anything listens behind
+# it. Wait up to 10 seconds, then start the session anyway.
+i=0
+until curl -s -o /dev/null --max-time 1 --noproxy '*' http://127.0.0.1:10551/; do
+  i=$((i + 1))
+  if [ "$i" -ge 20 ]; then
+    echo "[post_create] the tailnet proxy on 127.0.0.1:10551 is not up yet" >&2
+    break
+  fi
+  sleep 0.5
+done
+unset i
 ```
 
-Argus sources this hook before starting an agent, and before a shell session's login shell. Neither path reads `~/.zshrc` first, so anything agents need in their environment must come from the hook.
-
-The hook seeds `$HOME` itself before anything else. supervisord's `home-bootstrap` does the same at container start, but a session that starts together with the stack can reach its shell first, and zsh then opens its new-user menu on an empty home. `home-bootstrap.sh` only fills in what is missing, so running it twice is harmless.
-
-`wait-proxy` waits up to 10 seconds for tailscaled's proxy, so a session that starts with the stack doesn't race it. On timeout it prints a warning and returns, and the session starts anyway. `env.sh` sets `ALL_PROXY`, `HTTP_PROXY` and `HTTPS_PROXY` (upper and lower case) to `http://localhost:1055`, and `NO_PROXY` to `localhost,127.0.0.1,::1`.
+The hook is sourced, so it must not `exit`. Neither session path reads `~/.zshrc` first, so anything agents need in their environment must come from the hook.
 
 ### .dockerignore
 
@@ -138,11 +169,15 @@ hooks/
 
 ### Host directories
 
-Create `.home` and `.tailscale` as yourself before the first start. If either is missing, Docker creates it owned by root, and the profile user can then neither seed its home nor keep a Tailscale login:
+Create `.home` and `.tailscale` as yourself before the first start. If `.home` is missing, Docker creates it owned by root, and the profile user can't seed it. tailscaled runs in `netguard` as a root without `DAC_OVERRIDE`, so on Linux it can't use a directory another user owns: hand `.tailscale` to root, through a container so it needs no `sudo`:
 
 ```sh
-mkdir -p .home .tailscale && chmod 0700 .tailscale
+mkdir -p .home .tailscale
+docker run --rm -v "$PWD/.tailscale:/s" ghcr.io/bxnlabs/argus-containers/profile:main \
+  sh -c 'chown -R 0:0 /s && chmod 0700 /s'
 ```
+
+Run the same `docker run` in a profile that kept its `.tailscale` from before tailscaled moved into `netguard`; that state belongs to the profile user. On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
 
 ### First start and agent logins
 
@@ -150,9 +185,9 @@ mkdir -p .home .tailscale && chmod 0700 .tailscale
 argus profile up <name>
 ```
 
-Agent credentials and settings are not in the image. They live in the profile's `.home`. Open a shell session in the profile and log in to each agent you use once (`claude`, `codex login`, `agy`, `omp`). The login persists across restarts and image updates.
+Sessions run on the host, so agents use the host user's own credentials and settings in the host's `$HOME`, not the image or the profile's `.home`. If you haven't logged in to an agent on the host yet, open a shell session in the profile and log in once (`claude`, `codex login`, `agy`, `omp`). The profile's `.home` is the `$HOME` of commands run with `argus profile exec --compose`.
 
-To join a tailnet, run `tailscale up` in that shell. The login persists in `.tailscale/`.
+To join a tailnet, run `argus profile exec --compose <name> -- tailscale up`. The login persists in `.tailscale/`.
 
 ## Updating a profile
 
@@ -201,27 +236,34 @@ Remove the `@sha256:…` pin to follow `:main` again.
 
 ## Networking
 
-tailscaled runs in userspace mode without container privileges, so processes in the container reach the tailnet only through its proxy on `localhost:1055`. Anything else goes out directly.
+tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
-- **HTTP and HTTPS:** clients that honor `HTTP_PROXY`/`HTTPS_PROXY` (curl, most CLIs and SDKs) work unchanged in sessions, because the hook sets them.
-- **SOCKS5-aware tools** can use `ALL_PROXY`, or `socks5://localhost:1055` explicitly.
-- **Other TCP:** use `tailscale nc`, which dials through tailscaled. For SSH:
+- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- psql -h db-host …`. Raw-TCP tools that can't use a proxy, such as `psql`, must run this way, which is why the image ships `psql`, `nc` and `ping`. Add other clients to the profile's Dockerfile.
+- **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. Clients that honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (curl, kubectl, gh, most CLIs and SDKs) work unchanged, because the hook sets them. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. For SSH, use the proxy as a SOCKS5 proxy:
 
   ```sh
-  ssh -o ProxyCommand='tailscale nc %h %p' user@host
+  ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10551 %h %p' user@host
   ```
 
-  For any other TCP service, use `tailscale nc <host> <port>` as a pipe, or use it as the proxy command of a tool that supports one.
+  The host's own `tailscale nc` talks to the host's tailnet, not the profile's.
+
+**DNS.** With its default `--accept-dns`, tailscaled rewrites `netguard`'s `/etc/resolv.conf` to use MagicDNS (100.100.100.100), and Docker gives the agent the same file. Short names, tailnet FQDNs and internet names all resolve in the agent with no `dns:` setting.
+
+**IP collisions.** Every tailnet draws addresses from 100.64.0.0/10, so a peer on the profile's tailnet can have the same `100.x` address as one on the host's. In the stack and through the proxy, that address means the profile's peer. Prefer MagicDNS names.
 
 ### Network guard
 
-Traffic from the container also has an ordinary path through the Docker bridge and the host. The host routes its own tailnet's addresses out of `tailscale0`, so without a guard, unproxied traffic from the container would reach the host's tailnet peers as the host.
+Traffic from the stack also has an ordinary path through the Docker bridge and the host. The host routes its own tailnet's addresses out of its `tailscale0`, so without a guard, traffic from the stack to a `100.x` address the profile's tailnet doesn't have would reach the host's tailnet peers as the host.
 
-The `netguard` service closes that path. It adds an `unreachable` route for each prefix in `NETGUARD_TAILNET_PREFIXES` (default `100.64.0.0/10`), and it runs with IPv6 disabled. The agent shares its network namespace, and the agent's default capabilities do not include `NET_ADMIN`, so session processes cannot change the routes. The guard is not a security boundary: the agent is trusted, as it is on the host.
+`netguard.sh` closes that path before it starts tailscaled. It adds an `unreachable` route for each prefix in `NETGUARD_TAILNET_PREFIXES` (default `100.64.0.0/10`) to the namespace's main routing table, and it requires IPv6 to be disabled. It re-adds the routes on every start, because each start gets a new namespace. tailscaled puts a route for each of the profile's peers into its own table 52, which the kernel consults before the main table. So the profile's peers are reachable, and every other tailnet address hits the guard. That holds for tailscaled's own connections too, so the published proxy can't reach the host's tailnet either.
+
+The agent's default capabilities do not include `NET_ADMIN`, so session processes cannot change the routes. The guard is not a security boundary: the agent is trusted, as it is on the host. The agent shares tailscaled's socket and is its operator, so it has full control of tailscaled: it can run `tailscale up`, `down` and `logout`, accept subnet routes, pick an exit node, or `serve`. Through those it can change the stack's routing without `NET_ADMIN`.
+
+`netguard` needs only `NET_ADMIN` and `/dev/net/tun`. With tailscaled's default firewall backend, iptables, it would also need `NET_RAW`; `TS_DEBUG_FIREWALL_MODE: nftables` avoids that. `net.ipv4.conf.all.src_valid_mark` is set as a service sysctl because tailscaled can't set it inside a container.
 
 If the host accepts subnet routes from its tailnet, add those prefixes to `NETGUARD_TAILNET_PREFIXES`. The e2e preflight checks this.
 
-**If `netguard` stops while the agent keeps running,** the agent is left with no network at all. This fails closed: internet egress is cut too, but no path to the host tailnet opens. `argus profile up` does not repair it, because Compose leaves an unchanged running agent attached to the old namespace. To recover, stop the profile's sessions, then run `argus profile down <name>` and `argus profile up <name>`.
+**If `netguard` restarts while the agent keeps running,** the agent stays in the old namespace with only `lo`. This fails closed: tailnet and internet are both cut, and no path to the host tailnet opens. `tailscale status` in the agent still looks healthy, because the socket reaches the new tailscaled. `argus profile up` and `docker compose up -d` do not repair a restart, because Compose leaves an unchanged running agent attached to the old namespace. Restart the agent: `docker compose -p argus-<name> restart agent` (with the variables Argus passes, as in [Updating a profile](#updating-a-profile)), or stop the profile's sessions and run `argus profile down <name>` and `argus profile up <name>`. After a *recreate* of `netguard`, the next `up` recreates the agent too.
 
 ## Agent CLI versions
 
@@ -255,39 +297,34 @@ When Argus supports a new agent CLI, add it to the image and to `.github/scripts
 
 ## Tailnet-separation e2e
 
-`e2e/tailnet-separation.sh` proves, through Argus, that a dockerized profile's container joins a tailnet that is not the host's and that the two stay separate. It enrolls a throwaway target node and the profile's agent in a dedicated test tailnet, runs its checks inside a real Argus shell session, and cleans up after itself.
+`e2e/tailnet-separation.sh` proves, through Argus, that a dockerized profile joins a tailnet that is not the host's and that the two stay separate. It enrolls a throwaway target node and the profile in a dedicated test tailnet, then checks both paths: the agent's native routing, through `argus profile exec --compose`, and the host's published proxy, directly and through `argus profile exec`. It cleans up after itself.
 
 ### Prerequisites (once)
 
 1. Create a new tailnet for this test, separate from the host's. Keep MagicDNS enabled (the default).
-2. In its access control policy, add:
+2. Create an auth key that is **reusable** (the run enrolls two nodes), **ephemeral** (logging out removes a node) and **pre-approved**. Write it to a file with mode `0600`.
+3. Pick one peer on the host's tailnet that answers on TCP port 22 from the host. It is the only host-tailnet address the run probes.
 
-   ```json
-   {
-     "tagOwners": { "tag:argus-e2e": ["autogroup:admin"] },
-     "grants": [
-       { "src": ["tag:argus-e2e"], "dst": ["tag:argus-e2e"], "ip": ["*"] }
-     ]
-   }
-   ```
+The profile must follow the recipe above, with three additions to its `compose.yaml`: a secret named `authkey` that holds the key file, mounted into the agent,
 
-3. Create an OAuth client with the scopes `auth_keys` (write) and `devices:core` (read and write), restricted to `tag:argus-e2e`.
-4. Write `~/.config/argus-e2e/<profile>.env` with mode `0600`:
+```yaml
+secrets:
+  authkey:
+    file: ${ARGUS_HOST_HOME}/path/to/authkey
 
-   ```sh
-   TS_E2E_OAUTH_CLIENT_ID=…
-   TS_E2E_OAUTH_CLIENT_SECRET=…
-   TS_E2E_TAILNET=…          # the test tailnet's name, as `tailscale status --json` reports .CurrentTailnet.Name
-   ```
+services:
+  agent:
+    secrets: [authkey]
+```
 
-The profile must follow the recipe above: a `netguard` service, a hook that sources `env.sh` and runs `export ARGUS_E2E_POST_CREATE=in-container-sentinel` (A7 checks for this exact value), and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
+and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run). The hook must export the proxy variables as in the recipe.
 
 ### Running it
 
 ```sh
-e2e/tailnet-separation.sh --profile acme-test
+e2e/tailnet-separation.sh --profile acme-test --host-peer 100.x.y.z
 ```
 
-Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `ip`, `python3` (for a probe listener on the host's tailnet IP), `git`, and a host `tailscale` CLI connected to the host's tailnet.
+Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `realpath` (GNU), `python3`, and a host `tailscale` CLI connected to the host's tailnet. It runs on macOS and Linux.
 
-The script prints one `PASS` or `FAIL` line per assertion (A1–A7). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (subnet routes, or an exit node). Concurrent runs are not supported. Teardown reports its own failures but does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
+The script prints one `PASS` or `FAIL` line per assertion (A1–A9). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (accepted subnet routes, or an exit node). A8 restarts and recreates `netguard`. Concurrent runs are not supported. Teardown logs both nodes out on every exit, reports its own failures, and does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
