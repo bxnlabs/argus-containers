@@ -37,12 +37,12 @@ touch "$tmp/docker-compose.yml" "$tmp/compose.yml"
 eq "compose order" "$tmp/compose.yml" "$(find_compose_file "$tmp")"
 rm -rf "$tmp"
 
-# is_run_name matches only generated names, not other argus-e2e-* sessions.
-ok is_run_name argus-e2e-79a901f3
-nok is_run_name argus-e2e-tailnet-separation
-nok is_run_name argus-e2e-79a901f
-nok is_run_name argus-e2e-target-79a901f3
-nok is_run_name xargus-e2e-79a901f3
+# is_target_project matches only generated target projects.
+ok is_target_project e2e-tailnet-target-79a901f3
+nok is_target_project e2e-tailnet-target-79a901f
+nok is_target_project argus-e2e-target-79a901f3
+nok is_target_project xe2e-tailnet-target-79a901f3
+nok is_target_project e2e-tailnet-target-79a901f3x
 
 # cidr_covers
 ok cidr_covers 100.64.0.0/10 100.65.124.11
@@ -55,21 +55,29 @@ nok cidr_covers 100.64.0.0/10 0.0.0.0/0
 nok cidr_covers 100.64.0.0/10 192.168.1.0/24
 nok cidr_covers 100.64.0.0/10 999.1.1.1
 
-# uncovered_routes: Review Focus #1 (exit node, subnet routes).
-table52=$'100.65.124.11 dev tailscale0 \n100.100.100.100 dev tailscale0 \nthrow 127.0.0.0/8 \n192.168.1.0/24 dev tailscale0 \ndefault dev tailscale0 '
-eq "uncovered: subnet and exit node" $'192.168.1.0/24\n0.0.0.0/0' "$(uncovered_routes 100.64.0.0/10 <<<"$table52")"
-eq "uncovered: comma list covers subnet" "0.0.0.0/0" "$(uncovered_routes '100.64.0.0/10, 192.168.0.0/16' <<<"$table52")"
-eq "uncovered: multi-line list covers subnet" "0.0.0.0/0" "$(uncovered_routes $'100.64.0.0/10,\n192.168.0.0/16' <<<"$table52")"
-eq "uncovered: host peers only" "" "$(uncovered_routes 100.64.0.0/10 <<<$'100.65.124.11 dev tailscale0 \n100.100.100.100 dev tailscale0 ')"
-eq "uncovered: empty table" "" "$(uncovered_routes 100.64.0.0/10 </dev/null)"
+# uncovered_routes reads one destination per line.
+routes=$'192.168.1.0/24\n100.100.100.100\n0.0.0.0/0'
+eq "uncovered: subnet and exit node" $'192.168.1.0/24\n0.0.0.0/0' "$(uncovered_routes 100.64.0.0/10 <<<"$routes")"
+eq "uncovered: comma list covers subnet" "0.0.0.0/0" "$(uncovered_routes '100.64.0.0/10, 192.168.0.0/16' <<<"$routes")"
+eq "uncovered: multi-line list covers subnet" "0.0.0.0/0" "$(uncovered_routes $'100.64.0.0/10,\n192.168.0.0/16' <<<"$routes")"
+eq "uncovered: /32 subnet route" "" "$(uncovered_routes '100.64.0.0/10,10.254.10.1/32' <<<10.254.10.1/32)"
+eq "uncovered: empty" "" "$(uncovered_routes 100.64.0.0/10 </dev/null)"
 
-# classify_login
-eq "login: logged out" logged-out "$(classify_login '{"BackendState":"NeedsLogin","Self":{"HostName":"prime"}}' e2e.example)"
-eq "login: abandoned e2e" e2e "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"e2e.example"},"Self":{"HostName":"argus-e2e-agent-1a2b3c4d"}}' e2e.example)"
-eq "login: e2e name on another tailnet" foreign "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"jeev.io"},"Self":{"HostName":"argus-e2e-agent-1a2b3c4d"}}' e2e.example)"
-eq "login: real login" foreign "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"e2e.example"},"Self":{"HostName":"prime"}}' e2e.example)"
-eq "login: stopped but logged in" foreign "$(classify_login '{"BackendState":"Stopped","CurrentTailnet":{"Name":"jeev.io"},"Self":{"HostName":"prime"}}' e2e.example)"
-eq "login: not json" foreign "$(classify_login 'not json' e2e.example)"
+# host_routes: subnet routes the host accepts, and an exit node.
+st='{"Peer":{"a":{"PrimaryRoutes":["10.254.10.1/32","fd00::/64"]},"b":{}}}'
+eq "host routes: subnet, IPv6 dropped" "10.254.10.1/32" "$(host_routes "$st" true)"
+eq "host routes: not accepted" "" "$(host_routes "$st" false)"
+eq "host routes: exit node" $'10.254.10.1/32\n0.0.0.0/0' "$(host_routes '{"ExitNodeStatus":{"ID":"x"},"Peer":{"a":{"PrimaryRoutes":["10.254.10.1/32"]}}}' true)"
+eq "host routes: none" "" "$(host_routes '{"Peer":{}}' true)"
+
+# classify_login: the second argument is the host's tailnet.
+eq "login: logged out" logged-out "$(classify_login '{"BackendState":"NeedsLogin","Self":{"HostName":"prime"}}' host.example)"
+eq "login: abandoned e2e" e2e "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"e2e.example"},"Self":{"HostName":"argus-e2e-agent-1a2b3c4d"}}' host.example)"
+eq "login: e2e name on the host's tailnet" foreign "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"host.example"},"Self":{"HostName":"argus-e2e-agent-1a2b3c4d"}}' host.example)"
+eq "login: e2e-like name" foreign "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"e2e.example"},"Self":{"HostName":"argus-e2e-agent-1a2b3c4d-2"}}' host.example)"
+eq "login: real login" foreign "$(classify_login '{"BackendState":"Running","CurrentTailnet":{"Name":"e2e.example"},"Self":{"HostName":"prime"}}' host.example)"
+eq "login: stopped but logged in" foreign "$(classify_login '{"BackendState":"Stopped","CurrentTailnet":{"Name":"jeev.io"},"Self":{"HostName":"prime"}}' host.example)"
+eq "login: not json" foreign "$(classify_login 'not json' host.example)"
 
 # state_file_login: the stopped-stack check.
 tmp=$(mktemp -d)
@@ -96,25 +104,20 @@ printf '{"_current-profile":"%s","_profiles":"@@@"}' "$cur" >"$tmp/s"
 nok state_file_login "$tmp/s"
 rm -rf "$tmp"
 
-# marker_result: Review Focus #5. ($(...) strips the trailing newline of the
-# body, so expectations end without one.)
-id=deadbeef-3-12345
-pane="user@prime ~ % printf '%s:%s:%s\n' ARGUS-E2E BEGIN $id; cmd; printf '%s:%s:%s:rc=%d\n' ARGUS-E2E END $id \$?
-ARGUS-E2E:BEGIN:$id
-line one
-line two
-ARGUS-E2E:END:$id:rc=0
-user@prime ~ %"
-eq "marker: body and rc" $'rc=0\nline one\nline two' "$(marker_result "$id" <<<"$pane")"
-eq "marker: nonzero rc" "rc=3" "$(marker_result x <<<$'ARGUS-E2E:BEGIN:x\nARGUS-E2E:END:x:rc=3')"
-eq "marker: no trailing newline" $'rc=0\nfoo' "$(marker_result x <<<$'ARGUS-E2E:BEGIN:x\nfooARGUS-E2E:END:x:rc=0')"
-eq "marker: other ids ignored" $'rc=0\nmine' "$(marker_result x <<<$'ARGUS-E2E:BEGIN:y\ntheirs\nARGUS-E2E:END:y:rc=1\nARGUS-E2E:BEGIN:x\nmine\nARGUS-E2E:END:x:rc=0')"
-nok marker_result x <<<$'ARGUS-E2E:BEGIN:x\nstill running'
-nok marker_result x <<<"printf '%s:%s:%s\n' ARGUS-E2E BEGIN x; sleep 9; printf '%s:%s:%s:rc=%d\n' ARGUS-E2E END x \$?"
-nok marker_result x <<<$'ARGUS-E2E:BEGIN:x\nARGUS-E2E:END:x:rc=abc'
+# proxy_port and authkey_file read `docker compose config --format json`.
+cfg='{"services":{"agent":{"secrets":[{"source":"authkey","target":"authkey"}]},"netguard":{"ports":[{"target":22,"published":"2222","host_ip":"127.0.0.1"},{"target":1055,"published":"10551","host_ip":"127.0.0.1"}]}},"secrets":{"authkey":{"name":"p_authkey","file":"/home/u/.cache/key"}}}'
+eq "proxy port" 10551 "$(proxy_port "$cfg")"
+nok proxy_port '{"services":{"netguard":{"ports":[{"target":1055,"published":"10551","host_ip":"0.0.0.0"}]}}}'
+nok proxy_port '{"services":{"netguard":{}}}'
+eq "authkey file" /home/u/.cache/key "$(authkey_file "$cfg")"
+nok authkey_file '{"services":{"agent":{}},"secrets":{"authkey":{"file":"/k"}}}'
+nok authkey_file '{"services":{"agent":{"secrets":[{"source":"authkey"}]}}}'
 
-# strip_ctrl
-eq "strip_ctrl" $'a\tb\nc' "$(printf 'a\tb\r\n\033[31mc' | strip_ctrl | sed 's/\[31m//')"
+# parse_args requires --host-peer, a tailnet IPv4 address.
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p 2>/dev/null"
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 10.0.0.1 2>/dev/null"
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.79.139.70/32 2>/dev/null"
+ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.79.139.70 && [[ \$HOST_PEER == 100.79.139.70 ]]"
 
 # tmpl keeps & and backslashes in values literally.
 eq "tmpl" 'curl http://a&b\c:8080/ -o x' "$(tmpl 'curl http://@H@:@P@/ -o x' H 'a&b\c' P 8080)"

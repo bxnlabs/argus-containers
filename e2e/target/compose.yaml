@@ -1,0 +1,27 @@
+# The e2e's target node: a peer on the test tailnet that serves the run's
+# nonce over HTTP on 8080 and a trust-auth PostgreSQL on 5432. The node runs
+# tailscaled in userspace mode, which hands inbound tailnet connections to the
+# services sharing its network namespace. tailnet-separation.sh sets every
+# variable below.
+secrets:
+  authkey:
+    file: ${E2E_KEY_FILE}
+
+services:
+  node:
+    image: ${E2E_TARGET_IMAGE}
+    user: root
+    entrypoint: ["/e2e/run.sh"]
+    environment:
+      NONCE: ${NONCE}
+      RUN_ID: ${RUN_ID}
+    secrets: [authkey]
+    volumes:
+      - ./run.sh:/e2e/run.sh:ro
+
+  postgres:
+    image: ${E2E_POSTGRES_IMAGE}
+    network_mode: service:node
+    depends_on: [node]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust

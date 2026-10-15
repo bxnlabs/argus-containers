@@ -95,15 +95,15 @@ check_update_env() {
   fi
 }
 
-# supervisord as an arbitrary non-root UID over empty HOME and state
-# directories, as a profile runs it.
+# supervisord as an arbitrary non-root UID over an empty HOME, as a profile's
+# agent runs it. tailscaled runs in netguard, not here.
 check_supervisord() {
-  local work cid out
+  local work cid
   work=$(mktemp -d)
-  mkdir -p "$work/home" "$work/ts"
-  chmod 0777 "$work/home" "$work/ts"
+  mkdir -p "$work/home"
+  chmod 0777 "$work/home"
   cid=$(docker run -d --user 12345:12345 -e HOME=/home/smoke \
-    -v "$work/home:/home/smoke" -v "$work/ts:/var/lib/tailscale" \
+    -v "$work/home:/home/smoke" \
     "$image" /usr/bin/supervisord -c /etc/supervisor/supervisord.conf)
 
   # shellcheck disable=SC2016 # $HOME must expand in the container, not here.
@@ -114,49 +114,29 @@ check_supervisord() {
     docker exec "$cid" cat /opt/argus/share/supervisor/home-bootstrap.log
   fi
 
-  if retry 30 docker exec "$cid" bash -c 'exec 3<>/dev/tcp/localhost/1055'; then
-    pass "tailscaled's proxy accepts connections on localhost:1055"
+  if docker exec "$cid" pgrep -x tailscaled >/dev/null; then
+    fail "supervisord started tailscaled in the agent"
   else
-    fail "nothing is listening on localhost:1055"
-    docker exec "$cid" tail -n 30 /opt/argus/share/supervisor/tailscaled.log
-  fi
-
-  if out=$(docker exec "$cid" /opt/argus/bin/wait-proxy 2>&1) && [[ -z $out ]]; then
-    pass "wait-proxy returns silently once the proxy is up"
-  else
-    fail "wait-proxy with the proxy up: $out"
+    pass "supervisord does not run tailscaled"
   fi
 
   docker rm -f "$cid" >/dev/null
   # Files written by UID 12345 are not removable by the runner's user.
-  docker run --rm -v "$work:/w" "$image" rm -rf /w/home /w/ts
+  docker run --rm -v "$work:/w" "$image" rm -rf /w/home
   rmdir "$work"
 }
 
-check_wait_proxy_timeout() {
-  local out
-  if out=$(docker run --rm -e WAIT_PROXY_TIMEOUT=2 "$image" bash -c '
-      start=$SECONDS
-      /opt/argus/bin/wait-proxy 2>/tmp/err
-      rc=$?
-      elapsed=$((SECONDS - start))
-      cat /tmp/err
-      [ "$rc" -eq 0 ] && [ "$elapsed" -le 5 ] && grep -q "not accepting connections" /tmp/err' 2>&1); then
-    pass "wait-proxy warns and returns 0 when tailscaled is down"
+# Routing is native in the stack, so the agent needs no proxy settings.
+check_no_agent_proxy() {
+  local out image_env
+  if out=$(docker run --rm "$image" sh -c '
+      for f in /opt/argus/bin/wait-proxy /opt/argus/etc/env.sh /etc/supervisor/conf.d/tailscaled.conf; do
+        if [ -e "$f" ]; then echo "$f exists"; exit 1; fi
+      done' 2>&1); then
+    pass "no wait-proxy, env.sh or tailscaled supervisor program"
   else
-    fail "wait-proxy without tailscaled: $out"
+    fail "agent proxy leftovers: $out"
   fi
-}
-
-check_env_sh() {
-  local got want image_env
-  got=$(docker run --rm "$image" sh -c '. /opt/argus/etc/env.sh && env' | grep -iE '^(all|http|https|no)_proxy=' | sort)
-  want=$(printf '%s\n' \
-    ALL_PROXY=http://localhost:1055 all_proxy=http://localhost:1055 \
-    HTTP_PROXY=http://localhost:1055 http_proxy=http://localhost:1055 \
-    HTTPS_PROXY=http://localhost:1055 https_proxy=http://localhost:1055 \
-    NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 | sort)
-  if [[ $got == "$want" ]]; then pass "env.sh exports the proxy variables"; else fail "env.sh exports:"$'\n'"$got"; fi
   image_env=$(docker image inspect --format '{{json .Config.Env}}' "$image")
   if grep -qi proxy <<<"$image_env"; then
     fail "image ENV sets a proxy variable: $image_env"
@@ -165,14 +145,38 @@ check_env_sh() {
   fi
 }
 
-# netguard in the configuration a profile runs it in: root, only NET_ADMIN,
-# IPv6 disabled by sysctl. The prefixes span two lines, as a YAML block
-# scalar in compose.yaml would pass them.
+# Raw-TCP and ICMP tools run in the stack. Docker's default
+# net.ipv4.ping_group_range lets a non-root user ping without NET_RAW.
+check_net_tools() {
+  local out
+  if out=$(docker run --rm --user 12345:12345 "$image" sh -c '
+      for c in psql nc ping; do command -v "$c" >/dev/null || { echo "$c is missing"; exit 1; }; done
+      ping -c 1 -W 2 127.0.0.1 >/dev/null' 2>&1); then
+    pass "psql, nc and ping are installed; ping works as a non-root user"
+  else
+    fail "network tools: $out"
+  fi
+}
+
+# netguard_args: docker run arguments for netguard as a profile runs it: root,
+# only NET_ADMIN, the TUN device, IPv6 disabled, the nftables firewall.
+netguard_args=(--user root --cap-drop ALL --cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun
+  --sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.conf.all.src_valid_mark=1
+  -e TS_DEBUG_FIREWALL_MODE=nftables)
+
+# The TUN device is the Docker host's; skip the TUN checks where it has none.
+have_tun() {
+  docker run --rm --device /dev/net/tun:/dev/net/tun "$image" test -c /dev/net/tun >/dev/null 2>&1
+}
+
+# netguard in the configuration a profile runs it in, logged out. The
+# prefixes span two lines, as a YAML block scalar in compose.yaml would pass
+# them. The operator is a user the image has.
 check_netguard() {
-  local cid out
-  cid=$(docker run -d --user root --cap-drop ALL --cap-add NET_ADMIN \
-    --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+  local cid out port
+  cid=$(docker run -d "${netguard_args[@]}" -p 127.0.0.1::1055 \
     -e NETGUARD_TAILNET_PREFIXES=$'100.64.0.0/10,\n192.168.77.0/24' \
+    -e NETGUARD_TS_OPERATOR=nobody \
     --entrypoint /opt/argus/bin/netguard.sh "$image")
   if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
     pass "netguard healthcheck passes"
@@ -188,12 +192,119 @@ check_netguard() {
   fi
   # iproute2 reports the unreachable route as EHOSTUNREACH, which prints
   # "No route to host" or "Host is unreachable" depending on the version.
-  if out=$(docker exec "$cid" ip route get 100.79.1.1 2>&1); then
-    fail "ip route get found a route: $out"
-  elif [[ $out == *unreachable* || $out == *"No route to host"* ]]; then
-    pass "tailnet address is unreachable"
+  # tailscaled marks its own sockets with 0x80000, so check that path too.
+  local mark
+  for mark in "" "mark 0x80000"; do
+    # shellcheck disable=SC2086 # $mark is two words or none
+    if out=$(docker exec "$cid" ip route get 100.79.1.1 $mark 2>&1); then
+      fail "ip route get 100.79.1.1 $mark found a route: $out"
+    elif [[ $out == *unreachable* || $out == *"No route to host"* ]]; then
+      pass "tailnet address is unreachable${mark:+ with $mark}"
+    else
+      fail "ip route get 100.79.1.1 $mark: $out"
+    fi
+  done
+
+  out=$(docker exec "$cid" tailscale status --json 2>&1 | jq -r '.BackendState // empty' 2>&1)
+  if [[ $out == NeedsLogin ]]; then
+    pass "tailscaled answers on its socket (NeedsLogin)"
   else
-    fail "ip route get: $out"
+    fail "tailscale status: $out"
+  fi
+  if docker exec "$cid" ip link show tailscale0 >/dev/null 2>&1; then
+    pass "tailscaled runs in TUN mode (tailscale0 exists)"
+  else
+    fail "no tailscale0 device: $(docker exec "$cid" ip -br link 2>&1)"
+  fi
+  out=$(docker logs "$cid" 2>&1)
+  if grep -q "netfilter running in nftables mode" <<<"$out"; then
+    pass "tailscaled uses the nftables firewall"
+  else
+    fail "tailscaled is not in nftables mode: $(grep -iE 'netfilter|firewall|iptables' <<<"$out" | head -n 5)"
+  fi
+  if ! out=$(docker exec "$cid" tailscale status --json 2>&1) || ! out=$(jq -r '.Health[]?' <<<"$out" 2>&1); then
+    fail "cannot read tailscaled's health: $out"
+  elif grep -qiE 'firewall|netfilter|iptables|nftables' <<<"$out"; then
+    fail "firewall health warnings: $out"
+  else
+    pass "no firewall health warnings"
+  fi
+
+  out=$(docker exec "$cid" ss -ltnH 'sport = :1055')
+  if [[ $out == *"0.0.0.0:1055"* || $out == *"*:1055"* ]]; then
+    pass "tailscaled's proxy listens on 0.0.0.0:1055"
+  else
+    fail "nothing listens on 0.0.0.0:1055: $out"
+  fi
+  # Docker's port proxy accepts connections whatever listens behind it, so
+  # complete a SOCKS5 greeting: no-auth offered, no-auth chosen.
+  port=$(docker port "$cid" 1055/tcp | sed -n 's/^127\.0\.0\.1://p' | head -n 1)
+  # shellcheck disable=SC2016 # $1 expands in the inner bash
+  out=$(timeout 10 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" && printf "\x05\x01\x00" >&3 && head -c 2 <&3 | od -An -tx1' _ "${port:-0}" 2>&1)
+  if [[ $(tr -d ' \n' <<<"$out") == 0500 ]]; then
+    pass "the published port serves SOCKS5 to the host"
+  else
+    fail "the published port (${port:-none}) did not answer a SOCKS5 greeting: $out"
+  fi
+
+  if out=$(docker exec --user 65534:65534 "$cid" tailscale set --hostname=smoke-operator 2>&1); then
+    pass "the operator can change tailscaled's settings"
+  else
+    fail "the operator cannot change settings: $out"
+  fi
+  expect_read_only "$cid" "other non-root users are read-only" 12345:12345
+
+  # Each start gets a new namespace, so netguard must add the guard again.
+  docker restart -t 2 "$cid" >/dev/null
+  if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    pass "netguard restores the guard after a restart"
+  else
+    fail "netguard healthcheck never passed after a restart"
+    docker logs --tail 20 "$cid"
+  fi
+  docker rm -f "$cid" >/dev/null
+}
+
+# expect_read_only CID DESC USER: USER can read tailscaled's status but is
+# refused a settings change.
+expect_read_only() {
+  local out
+  if ! out=$(docker exec --user "$3" "$1" tailscale status --json 2>&1); then
+    fail "$2: status failed: $out"
+  elif out=$(docker exec --user "$3" "$1" tailscale set --hostname=smoke-other 2>&1); then
+    fail "$2: tailscale set succeeded"
+  elif [[ $out == *"Access denied"* ]]; then
+    pass "$2"
+  else
+    fail "$2: tailscale set failed for another reason: $out"
+  fi
+}
+
+# Without NETGUARD_TS_OPERATOR, netguard starts and sets no operator.
+check_netguard_no_operator() {
+  local cid out
+  cid=$(docker run -d "${netguard_args[@]}" --entrypoint /opt/argus/bin/netguard.sh "$image")
+  if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    pass "netguard starts without an operator"
+  else
+    fail "netguard without an operator never became healthy"
+    docker logs --tail 20 "$cid"
+  fi
+  expect_read_only "$cid" "with no operator, non-root users are read-only" 65534:65534
+  docker rm -f "$cid" >/dev/null
+}
+
+# Fallback for a Docker host without /dev/net/tun: tailscaled from the image
+# still starts and answers on its socket.
+check_tailscaled_socket_only() {
+  local cid out
+  cid=$(docker run -d --user root --entrypoint /opt/argus/bin/tailscaled "$image" \
+    --tun=userspace-networking --statedir=/var/lib/tailscale --socket=/var/run/tailscale/tailscaled.sock)
+  if retry 20 docker exec "$cid" tailscale status --json >/dev/null; then
+    pass "tailscaled answers on its socket (userspace fallback)"
+  else
+    fail "tailscaled never answered on its socket"
+    docker logs --tail 20 "$cid"
   fi
   docker rm -f "$cid" >/dev/null
 }
@@ -215,16 +326,26 @@ expect_netguard_exit() {
 }
 
 check_netguard_fails_loudly() {
+  local tun=(--device /dev/net/tun:/dev/net/tun --sysctl net.ipv4.conf.all.src_valid_mark=1)
   expect_netguard_exit "without NET_ADMIN" \
-    --user root --cap-drop ALL --sysctl net.ipv6.conf.all.disable_ipv6=1
+    --user root --cap-drop ALL "${tun[@]}" --sysctl net.ipv6.conf.all.disable_ipv6=1
   expect_netguard_exit "with IPv6 enabled" \
-    --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0
+    --user root --cap-drop ALL --cap-add NET_ADMIN "${tun[@]}" --sysctl net.ipv6.conf.all.disable_ipv6=0
   expect_netguard_exit "with a malformed prefix" \
-    --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    --user root --cap-drop ALL --cap-add NET_ADMIN "${tun[@]}" --sysctl net.ipv6.conf.all.disable_ipv6=1 \
     -e NETGUARD_TAILNET_PREFIXES=100.64.1.0/10
+  expect_netguard_exit "without /dev/net/tun" \
+    --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    --sysctl net.ipv4.conf.all.src_valid_mark=1
 }
 
-checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_wait_proxy_timeout check_env_sh check_netguard check_netguard_fails_loudly)
+checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_no_agent_proxy check_net_tools)
+if have_tun; then
+  checks+=(check_netguard check_netguard_no_operator check_netguard_fails_loudly)
+else
+  echo "NOTE this Docker host has no /dev/net/tun; netguard's TUN checks are skipped"
+  checks+=(check_tailscaled_socket_only)
+fi
 for c in "${checks[@]}"; do "$c"; done
 
 if ((failures)); then
