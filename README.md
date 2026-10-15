@@ -126,7 +126,7 @@ Argus passes `ARGUS_HOST_HOME`, `ARGUS_STATE_DIR`, `ARGUS_UID` and `ARGUS_GID` t
 
 `hostname` goes on `netguard` because Docker rejects it on a service that shares another container's network. It is also the name `tailscale up` registers the profile under; pass `--hostname` to register a different one.
 
-`netguard` runs tailscaled and keeps its state in `.tailscale`. The agent mounts only tailscaled's socket, so the `tailscale` CLI works there. `NETGUARD_TS_OPERATOR` names the user that may change tailscaled's settings without root, which is the agent's user here; leave it unset and only root in `netguard` can. `tailscale up` keeps the operator only when `$USER` names it, which is why the Dockerfile sets `USER`; without it, the first `tailscale up` clears the operator and `netguard` turns unhealthy. Pick a free host port for each profile's proxy (`10551` above).
+`netguard` runs tailscaled and keeps its state in `.tailscale`. The agent mounts only tailscaled's socket, so the `tailscale` CLI works there. `NETGUARD_TS_OPERATOR` names the user that may change tailscaled's settings without root, which is the agent's user here; leave it unset and only root in `netguard` can, even if an earlier start set an operator. `tailscale up` keeps the operator only when `$USER` names it, which is why the Dockerfile sets `USER`; without it, the first `tailscale up` clears the operator and `netguard` turns unhealthy. Pick a free host port for each profile's proxy (`10551` above).
 
 ### hooks/post_create.sh
 
@@ -169,11 +169,15 @@ hooks/
 
 ### Host directories
 
-Create `.home` and `.tailscale` as yourself before the first start. If `.home` is missing, Docker creates it owned by root, and the profile user can't seed it. tailscaled runs as root in `netguard`, so `.tailscale` only needs to keep others out:
+Create `.home` and `.tailscale` as yourself before the first start. If `.home` is missing, Docker creates it owned by root, and the profile user can't seed it. tailscaled runs in `netguard` as a root without `DAC_OVERRIDE`, so on Linux it can't use a directory another user owns: hand `.tailscale` to root, through a container so it needs no `sudo`:
 
 ```sh
-mkdir -p .home .tailscale && chmod 0700 .tailscale
+mkdir -p .home .tailscale
+docker run --rm -v "$PWD/.tailscale:/s" ghcr.io/bxnlabs/argus-containers/profile:main \
+  sh -c 'chown -R 0:0 /s && chmod 0700 /s'
 ```
+
+Run the same `docker run` in a profile that kept its `.tailscale` from before tailscaled moved into `netguard`; that state belongs to the profile user. On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
 
 ### First start and agent logins
 
@@ -235,7 +239,7 @@ Remove the `@sha256:…` pin to follow `:main` again.
 tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
 - **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- psql -h db-host …`. Raw-TCP tools that can't use a proxy, such as `psql`, must run this way, which is why the image ships `psql`, `nc` and `ping`. Add other clients to the profile's Dockerfile.
-- **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. Clients that honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (curl, kubectl, gh, most CLIs and SDKs) work unchanged, because the hook sets them. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. For SSH, use the proxy as a SOCKS5 proxy:
+- **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. Clients that honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (curl, kubectl, gh, most CLIs and SDKs) work unchanged, because the hook sets them. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. For SSH, use the proxy as a SOCKS5 proxy:
 
   ```sh
   ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10551 %h %p' user@host
@@ -260,15 +264,6 @@ The agent's default capabilities do not include `NET_ADMIN`, so session processe
 If the host accepts subnet routes from its tailnet, add those prefixes to `NETGUARD_TAILNET_PREFIXES`. The e2e preflight checks this.
 
 **If `netguard` restarts while the agent keeps running,** the agent stays in the old namespace with only `lo`. This fails closed: tailnet and internet are both cut, and no path to the host tailnet opens. `tailscale status` in the agent still looks healthy, because the socket reaches the new tailscaled. `argus profile up` and `docker compose up -d` do not repair a restart, because Compose leaves an unchanged running agent attached to the old namespace. Restart the agent: `docker compose -p argus-<name> restart agent` (with the variables Argus passes, as in [Updating a profile](#updating-a-profile)), or stop the profile's sessions and run `argus profile down <name>` and `argus profile up <name>`. After a *recreate* of `netguard`, the next `up` recreates the agent too.
-
-### Other VPNs
-
-The same shape works for other TUN VPNs, such as OpenVPN or NetBird: the daemon runs in `netguard` with `/dev/net/tun` and `NET_ADMIN`, and the agent inherits its routes. The image doesn't ship them. Points to check for each:
-
-- The guard must not swallow the VPN's ranges. NetBird also assigns peer addresses from 100.64.0.0/10, but its interface gets a more specific connected prefix (a /16 by default), so it should coexist. OpenVPN pushes plain routes, which are more specific than the guard; a pushed `redirect-gateway` moves all egress to the VPN.
-- DNS: NetBird manages `resolv.conf` as tailscaled does. OpenVPN needs an `up` script for that. Either way, editing `netguard`'s `resolv.conf` reaches the agent.
-- Neither has a built-in SOCKS or HTTP proxy. To keep host-side access, run a small proxy in `netguard`'s namespace.
-- The firewall backend and the capabilities it needs differ per daemon.
 
 ## Agent CLI versions
 

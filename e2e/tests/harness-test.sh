@@ -79,31 +79,6 @@ eq "login: real login" foreign "$(classify_login '{"BackendState":"Running","Cur
 eq "login: stopped but logged in" foreign "$(classify_login '{"BackendState":"Stopped","CurrentTailnet":{"Name":"jeev.io"},"Self":{"HostName":"prime"}}' host.example)"
 eq "login: not json" foreign "$(classify_login 'not json' host.example)"
 
-# state_file_login: the stopped-stack check.
-tmp=$(mktemp -d)
-eq "state: missing" logged-out "$(state_file_login "$tmp/none")"
-printf '{}' >"$tmp/s"
-eq "state: empty object" logged-out "$(state_file_login "$tmp/s")"
-cur=$(printf 'a1b2' | base64 -w0)
-profiles=$(printf '{"a1b2":{"ID":"a1b2","Name":"x"}}' | base64 -w0)
-printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$profiles" >"$tmp/s"
-eq "state: live login" logged-in "$(state_file_login "$tmp/s")"
-printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$(printf '{}' | base64 -w0)" >"$tmp/s"
-eq "state: dangling pointer" logged-out "$(state_file_login "$tmp/s")"
-# tailscaled's real shape: _current-profile holds the profile's state key
-# ("profile-<ID>"), which is the Key field of its _profiles entry.
-cur=$(printf 'profile-646f' | base64 -w0)
-profiles=$(printf '{"646f":{"ID":"646f","Key":"profile-646f","Name":"x"}}' | base64 -w0)
-printf '{"_current-profile":"%s","_machinekey":"x","_profiles":"%s","profile-646f":"x"}' "$cur" "$profiles" >"$tmp/s"
-eq "state: live login, real shape" logged-in "$(state_file_login "$tmp/s")"
-printf '{"_current-profile":"%s","_profiles":"%s"}' "$cur" "$(printf '{"77aa":{"ID":"77aa","Key":"profile-77aa"}}' | base64 -w0)" >"$tmp/s"
-eq "state: dangling pointer, real shape" logged-out "$(state_file_login "$tmp/s")"
-printf 'garbage' >"$tmp/s"
-nok state_file_login "$tmp/s"
-printf '{"_current-profile":"%s","_profiles":"@@@"}' "$cur" >"$tmp/s"
-nok state_file_login "$tmp/s"
-rm -rf "$tmp"
-
 # proxy_port and authkey_file read `docker compose config --format json`.
 cfg='{"services":{"agent":{"secrets":[{"source":"authkey","target":"authkey"}]},"netguard":{"ports":[{"target":22,"published":"2222","host_ip":"127.0.0.1"},{"target":1055,"published":"10551","host_ip":"127.0.0.1"}]}},"secrets":{"authkey":{"name":"p_authkey","file":"/home/u/.cache/key"}}}'
 eq "proxy port" 10551 "$(proxy_port "$cfg")"
@@ -130,6 +105,21 @@ nok caps_exactly_net_admin $'CapEff:\t0000000000001000\nCapBnd:\t000000000000300
 nok caps_exactly_net_admin $'CapEff:\t0000000000000000\nCapBnd:\t0000000000001000'
 nok caps_exactly_net_admin $'CapEff:\t0000000000001000'
 nok caps_exactly_net_admin ''
+
+# remove_leftover_targets: a target whose node has exited can't be logged
+# out, but removing its project is enough; only a failed removal is fatal.
+for case in "exec-fails:0" "down-fails:1"; do
+  out=$(MODE=${case%%:*} bash -c '
+    . "$1"
+    log() { :; }
+    compose_target() {
+      case "$MODE:$2" in
+        exec-fails:exec | down-fails:down) return 1 ;;
+      esac
+    }
+    remove_leftover_targets e2e-tailnet-target-1a2b3c4d; echo "rc=$?"' _ "$here/../tailnet-separation.sh" 2>/dev/null)
+  eq "leftover targets: ${case%%:*}" "rc=${case#*:}" "$out"
+done
 
 # logout_owned_login still logs out when the restarts and the health wait
 # fail, and reports the failure.

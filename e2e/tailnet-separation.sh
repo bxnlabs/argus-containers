@@ -26,7 +26,7 @@ HOST_PEER_PORT=22
 DEADLINE=60     # bound for polls, in seconds
 API_DEADLINE=15 # bound for a single status call
 STEP_TIMEOUT=30 # bound for each argus, docker and compose call
-STACK_TIMEOUT=900 # bound for the call that first brings the stack up (it may build)
+STACK_TIMEOUT=900 # bound for the calls that first bring up the stack (it may build) and the target
 DEFAULT_GUARD_PREFIXES=100.64.0.0/10
 
 log() { printf '[e2e] %s\n' "$*" >&2; }
@@ -131,38 +131,6 @@ classify_login() {
       elif ($cur != "" and $cur != $host_tn and ($host | test("^argus-e2e-agent-[0-9a-f]{8}$"))) then "e2e"
       else "foreign" end' <<<"$1" 2>/dev/null)
   printf '%s\n' "${out:-foreign}"
-}
-
-# state_file_login FILE: whether a stopped profile's tailscaled.state holds a
-# login. It does only when _current-profile names a profile that still exists
-# in _profiles: logout deletes the profile but can leave the pointer behind.
-# Fails when the file cannot be read or parsed.
-state_file_login() {
-  local file=$1 json cur profiles
-  if [[ ! -e $file ]]; then
-    echo logged-out
-    return 0
-  fi
-  json=$(cat -- "$file") || return 1
-  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$json" || return 1
-  cur=$(jq -r '."_current-profile" // ""' <<<"$json" | base64 -d 2>/dev/null) || return 1
-  if [[ -z $cur ]]; then
-    echo logged-out
-    return 0
-  fi
-  profiles=$(jq -r '."_profiles" // ""' <<<"$json" | base64 -d 2>/dev/null) || return 1
-  if [[ -z $profiles ]]; then
-    echo logged-out
-    return 0
-  fi
-  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$profiles" || return 1
-  # tailscaled stores the profile's state key (its Key field, "profile-<ID>")
-  # in _current-profile. A bare ID is accepted too.
-  if jq -e --arg k "$cur" 'has($k) or any(.[]; .Key? == $k)' >/dev/null <<<"$profiles"; then
-    echo logged-in
-  else
-    echo logged-out
-  fi
 }
 
 # proxy_port CONFIG_JSON: the host port that publishes netguard's port 1055
@@ -284,8 +252,8 @@ init_run() {
   TARGET_PROJECT=e2e-tailnet-target-$RUN_ID
   AGENT_HOST=argus-e2e-agent-$RUN_ID
   # Teardown acts only on what these record as this run's.
-  TARGET_STARTED=0 OWN_LOGIN=0 STACK_WAS_UP=0 ABANDONED_LOGIN=0 TEARDOWN_ERRORS=0
-  TARGET_IP="" TARGET_NAME="" OUT=""
+  TARGET_STARTED=0 OWN_LOGIN=0 STACK_WAS_UP=0 TEARDOWN_ERRORS=0
+  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS=""
 }
 
 # compose ARGS...: docker compose against the profile's stack, with the
@@ -301,13 +269,19 @@ compose() {
     timeout "$t" docker compose -p "argus-$PROFILE" -f "$COMPOSE_FILE" "$@"
 }
 
-# compose_target PROJECT ARGS...: docker compose against a target project.
+# compose_target [-t SECONDS] PROJECT ARGS...: docker compose against a target
+# project, bounded by STEP_TIMEOUT (or -t SECONDS).
 compose_target() {
-  local project=$1
+  local t=$STEP_TIMEOUT project
+  if [[ $1 == -t ]]; then
+    t=$2
+    shift 2
+  fi
+  project=$1
   shift
   E2E_KEY_FILE=$KEY_FILE E2E_TARGET_IMAGE=$TARGET_IMAGE E2E_POSTGRES_IMAGE=$POSTGRES_IMAGE \
     NONCE=$NONCE RUN_ID=$RUN_ID \
-    timeout "$STEP_TIMEOUT" docker compose -p "$project" -f "$TARGET_COMPOSE" "$@"
+    timeout "$t" docker compose -p "$project" -f "$TARGET_COMPOSE" "$@"
 }
 
 # in_stack [-t SECONDS] CMD: run CMD with bash in the profile stack's agent
@@ -392,12 +366,14 @@ logout_owned_login() {
 # logout_target PROJECT: log a target node out, which removes it from the
 # tailnet because its key is ephemeral, then remove the project.
 logout_target() {
-  compose_target "$1" exec -T node tailscale logout >/dev/null 2>&1
-  compose_target "$1" down -v -t 1 --remove-orphans >/dev/null
+  local rc=0
+  compose_target "$1" exec -T node tailscale logout >/dev/null || rc=1
+  compose_target "$1" down -v -t 1 --remove-orphans >/dev/null || rc=1
+  return "$rc"
 }
 
 preflight_checks() {
-  local c st uncovered services route_all host_routes_list
+  local c uncovered services route_all host_routes_list
   for c in argus docker curl jq timeout tailscale python3 od realpath; do
     command -v "$c" >/dev/null || die "missing host command: $c"
   done
@@ -429,7 +405,7 @@ preflight_checks() {
   log "host tailnet $HOST_TAILNET; host peer $HOST_PEER; proxy 127.0.0.1:$PROXY_PORT"
 
   # Without the prefs (an older CLI), assume the host accepts subnet routes.
-  route_all=$(timeout "$API_DEADLINE" tailscale debug prefs 2>/dev/null | jq -r '.RouteAll // empty' 2>/dev/null)
+  route_all=$(timeout "$API_DEADLINE" tailscale debug prefs 2>/dev/null | jq -r '.RouteAll | values' 2>/dev/null)
   host_routes_list=$(host_routes "$HOST_STATUS" "${route_all:-true}") || die "cannot read the host's tailnet routes"
   uncovered=$(uncovered_routes "$GUARD_PREFIXES" <<<"$host_routes_list")
   [[ -z $uncovered ]] ||
@@ -438,36 +414,53 @@ preflight_checks() {
   services=$(compose ps --status running --services) || die "cannot read the profile's stack state"
   if grep -qx netguard <<<"$services"; then
     STACK_WAS_UP=1
-    st=$(netguard_status)
-    case $(classify_login "$st" "$HOST_TAILNET") in
-      logged-out) ;;
-      e2e) ABANDONED_LOGIN=1 ;;
-      *) die "the profile is logged in to a tailnet this e2e does not own; log it out first (tailscale logout)" ;;
-    esac
-  else
-    case $(state_file_login "$PROFILE_DIR/.tailscale/tailscaled.state") in
-      logged-out) ;;
-      logged-in) die "the stopped profile has a saved Tailscale login; start it and run tailscale logout first" ;;
-      *) die "cannot read $PROFILE_DIR/.tailscale/tailscaled.state" ;;
-    esac
   fi
   log "stack was $( ((STACK_WAS_UP)) && echo up || echo down ) before the test"
 }
 
-# recover: clean up after earlier crashed runs.
+# login_settled: tailscaled has loaded any saved login. Sets LOGIN_STATUS.
+login_settled() {
+  LOGIN_STATUS=$(netguard_status) &&
+    jq -e '.BackendState != "NoState" and .BackendState != "Starting"' >/dev/null <<<"$LOGIN_STATUS"
+}
+
+# recover: bring the stack up, refuse a login this e2e does not own, and clean
+# up after earlier crashed runs. tailscaled's state is root's, so its login is
+# read from the running daemon; teardown stops a stack that was down.
 recover() {
   local projects p
-  if ((ABANDONED_LOGIN)); then
-    log "logging out a login left by an earlier e2e run"
-    OWN_LOGIN=1
-    logout_owned_login || die "could not log out the abandoned e2e login"
-  fi
+  log "bringing the profile's stack up through Argus"
+  in_stack -t "$STACK_TIMEOUT" true || die "argus profile exec --compose failed: $OUT"
+  wait_until "$DEADLINE" login_settled || die "tailscaled never loaded its state: $LOGIN_STATUS"
+  case $(classify_login "$LOGIN_STATUS" "$HOST_TAILNET") in
+    logged-out) ;;
+    e2e)
+      log "logging out a login left by an earlier e2e run"
+      OWN_LOGIN=1
+      logout_owned_login || die "could not log out the abandoned e2e login"
+      ;;
+    *) die "the profile is logged in to a tailnet this e2e does not own; log it out first (tailscale logout)" ;;
+  esac
   projects=$(timeout "$STEP_TIMEOUT" docker compose ls -a --format json | jq -r '.[].Name') ||
     die "listing compose projects failed"
+  local leftovers=()
   for p in $projects; do
-    is_target_project "$p" || continue
+    is_target_project "$p" && leftovers+=("$p")
+  done
+  remove_leftover_targets "${leftovers[@]}" || die "could not remove a leftover target project"
+}
+
+# remove_leftover_targets PROJECT...: remove target projects left by earlier
+# runs. A node whose container has exited can't be logged out; its key is
+# ephemeral, so the tailnet removes it once it is offline. Fails only when a
+# project can't be removed.
+remove_leftover_targets() {
+  local p
+  for p in "$@"; do
     log "removing leftover target project $p"
-    logout_target "$p" || die "could not remove $p"
+    compose_target "$p" exec -T node tailscale logout >/dev/null 2>&1 ||
+      log "could not log $p's node out; removing the project anyway"
+    compose_target "$p" down -v -t 1 --remove-orphans >/dev/null || return 1
   done
 }
 
@@ -486,8 +479,9 @@ target_ready() {
 start_target() {
   log "starting target project $TARGET_PROJECT"
   TARGET_STARTED=1
-  compose_target "$TARGET_PROJECT" up -d >/dev/null 2>&1 || {
-    log "docker compose up for the target failed"
+  # The first start may pull the images.
+  OUT=$(compose_target -t "$STACK_TIMEOUT" "$TARGET_PROJECT" up -d 2>&1) || {
+    log "docker compose up for the target failed: $OUT"
     return 1
   }
   if ! wait_until "$DEADLINE" target_ready; then
@@ -512,15 +506,10 @@ agent_logged_in() {
 }
 
 start_agent() {
-  log "bringing the profile's stack up through Argus"
-  in_stack -t "$STACK_TIMEOUT" true || {
-    log "argus profile exec --compose failed: $OUT"
-    return 1
-  }
   wait_until "$DEADLINE" daemon_needs_login ||
     { log "tailscaled never reported NeedsLogin: $OUT"; return 1; }
-  # From here on, any login in the profile is this run's: preflight saw it
-  # logged out, or recovered the abandoned e2e login.
+  # From here on, any login in the profile is this run's: recover saw it
+  # logged out, or logged out the abandoned e2e login.
   OWN_LOGIN=1
   log "enrolling $AGENT_HOST from the agent"
   in_stack -t 60 "timeout -k 5 45 tailscale up --auth-key=file:/run/secrets/authkey --hostname=$AGENT_HOST" ||

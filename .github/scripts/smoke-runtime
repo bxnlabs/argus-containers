@@ -164,9 +164,16 @@ netguard_args=(--user root --cap-drop ALL --cap-add NET_ADMIN --device /dev/net/
   --sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.conf.all.src_valid_mark=1
   -e TS_DEBUG_FIREWALL_MODE=nftables)
 
-# The TUN device is the Docker host's; skip the TUN checks where it has none.
-have_tun() {
-  docker run --rm --device /dev/net/tun:/dev/net/tun "$image" test -c /dev/net/tun >/dev/null 2>&1
+# The TUN device is the Docker host's. Every netguard check needs it, so a
+# host without it fails the suite rather than skipping them.
+check_tun() {
+  local out
+  if out=$(docker run --rm --device /dev/net/tun:/dev/net/tun "$image" test -c /dev/net/tun 2>&1); then
+    pass "the Docker host has /dev/net/tun"
+  else
+    fail "no usable /dev/net/tun on this Docker host; netguard's checks did not run: $out"
+    return 1
+  fi
 }
 
 # netguard in the configuration a profile runs it in, logged out. The
@@ -230,11 +237,15 @@ check_netguard() {
     pass "no firewall health warnings"
   fi
 
-  out=$(docker exec "$cid" ss -ltnH 'sport = :1055')
-  if [[ $out == *"0.0.0.0:1055"* || $out == *"*:1055"* ]]; then
-    pass "tailscaled's proxy listens on 0.0.0.0:1055"
+  # The proxy must not listen on the tailnet address, so it listens only on
+  # the bridge address Docker publishes.
+  local addr
+  addr=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid")
+  out=$(docker exec "$cid" ss -ltnH 'sport = :1055' | awk '{ print $4 }' | sort -u)
+  if [[ -n $addr && $out == "$addr:1055" ]]; then
+    pass "tailscaled's proxy listens only on $addr:1055"
   else
-    fail "nothing listens on 0.0.0.0:1055: $out"
+    fail "tailscaled's proxy should listen only on ${addr:-the bridge address}:1055: $out"
   fi
   # Docker's port proxy accepts connections whatever listens behind it, so
   # complete a SOCKS5 greeting: no-auth offered, no-auth chosen.
@@ -329,21 +340,6 @@ check_netguard_no_operator() {
   docker rm -f "$cid" >/dev/null
 }
 
-# Fallback for a Docker host without /dev/net/tun: tailscaled from the image
-# still starts and answers on its socket.
-check_tailscaled_socket_only() {
-  local cid out
-  cid=$(docker run -d --user root --entrypoint /opt/argus/bin/tailscaled "$image" \
-    --tun=userspace-networking --statedir=/var/lib/tailscale --socket=/var/run/tailscale/tailscaled.sock)
-  if retry 20 docker exec "$cid" tailscale status --json >/dev/null; then
-    pass "tailscaled answers on its socket (userspace fallback)"
-  else
-    fail "tailscaled never answered on its socket"
-    docker logs --tail 20 "$cid"
-  fi
-  docker rm -f "$cid" >/dev/null
-}
-
 # expect_netguard_exit DESC DOCKER_RUN_ARGS...: netguard must exit nonzero,
 # not sit running without a guard.
 expect_netguard_exit() {
@@ -372,14 +368,21 @@ check_netguard_fails_loudly() {
   expect_netguard_exit "without /dev/net/tun" \
     --user root --cap-drop ALL --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 \
     --sysctl net.ipv4.conf.all.src_valid_mark=1
+  # A state directory another user owns is unwritable to a root without
+  # DAC_OVERRIDE, and tailscaled would fall back to an in-memory store.
+  # volume-nocopy keeps Docker from copying the image's root-owned directory
+  # over the volume's ownership.
+  local vol=netguard-smoke-state-$RANDOM
+  docker run --rm -v "$vol:/s" "$image" sh -c 'chown 12345:12345 /s && chmod 0700 /s'
+  expect_netguard_exit "with a state directory it cannot write" \
+    --user root --cap-drop ALL --cap-add NET_ADMIN "${tun[@]}" --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    --mount "type=volume,src=$vol,dst=/var/lib/tailscale,volume-nocopy"
+  docker volume rm -f "$vol" >/dev/null
 }
 
 checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_no_agent_proxy check_net_tools)
-if have_tun; then
+if check_tun; then
   checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_fails_loudly)
-else
-  echo "NOTE this Docker host has no /dev/net/tun; netguard's TUN checks are skipped"
-  checks+=(check_tailscaled_socket_only)
 fi
 for c in "${checks[@]}"; do "$c"; done
 
