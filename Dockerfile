@@ -76,7 +76,7 @@ ARG AZURE_CLI_VERSION=2.91.0
 # renovate: datasource=github-releases packageName=derailed/k9s
 ARG K9S_VERSION=0.51.0
 # renovate: datasource=node-version packageName=node
-ARG NODE_VERSION=24.21.0
+ARG NODE_VERSION=24.22.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
 ARG CLAUDE_CODE_VERSION=2.1.300
 # renovate: datasource=npm packageName=@openai/codex
