@@ -71,7 +71,7 @@ ARG TARGETARCH
 # renovate: datasource=github-releases packageName=tailscale/tailscale
 ARG TAILSCALE_VERSION=1.104.1
 # renovate: datasource=github-releases packageName=pulumi/pulumi
-ARG PULUMI_VERSION=3.268.0
+ARG PULUMI_VERSION=3.269.0
 # renovate: datasource=custom.gcloud packageName=google-cloud-cli
 ARG GCLOUD_VERSION=589.0.0
 # renovate: datasource=github-tags packageName=aws/aws-cli
