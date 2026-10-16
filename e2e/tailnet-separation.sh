@@ -303,15 +303,17 @@ compose_target() {
 
 # in_stack [-t SECONDS] CMD: run CMD with bash in the profile stack's agent
 # service through `argus profile exec --compose`, as the agent's user. Sets
-# OUT to its output and returns its status. The working directory is $HOME,
-# which every profile mounts.
+# OUT to its output and returns its status. The working directory is the
+# state root, which every stack binds at its host path, because argus-lease
+# runs from it. $HOME won't do: the recipe mounts an isolated home over it,
+# and Argus refuses a working directory the agent doesn't share.
 in_stack() {
   local t=$STEP_TIMEOUT
   if [[ $1 == -t ]]; then
     t=$2
     shift 2
   fi
-  OUT=$(cd "$HOME" && timeout "$t" argus profile exec --compose "$PROFILE" -- bash -c "$1" </dev/null 2>&1)
+  OUT=$(cd "$STATE_DIR" && timeout "$t" argus profile exec --compose "$PROFILE" -- bash -c "$1" </dev/null 2>&1)
 }
 
 # on_host_hooked CMD: run CMD with bash on the host in the profile's

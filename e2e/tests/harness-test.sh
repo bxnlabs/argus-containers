@@ -351,6 +351,17 @@ done
 unset -f timeout
 eq "unreachable: a real refusal" fail "$(bash -c "$(unreachable_cmd 127.0.0.1 1)" >/dev/null && echo pass || echo fail)"
 
+# in_stack runs from the state dir, which every stack binds at its host path
+# (argus-lease runs from it). $HOME may be an isolated home mounted over it,
+# which `profile exec --compose` refuses.
+tmp=$(mktemp -d)
+eq "in_stack: cwd is the state dir" "$tmp" "$(STATE_DIR=$tmp PROFILE=p bash -c '
+  . "$1"
+  timeout() { shift; "$@"; }
+  argus() { pwd; }
+  in_stack true; printf "%s\n" "$OUT"' _ "$here/../tailnet-separation.sh")"
+rm -rf "$tmp"
+
 # tmpl keeps & and backslashes in values literally.
 eq "tmpl" 'curl http://a&b\c:8080/ -o x' "$(tmpl 'curl http://@H@:@P@/ -o x' H 'a&b\c' P 8080)"
 
