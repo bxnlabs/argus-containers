@@ -98,6 +98,17 @@ check_net_tools() {
   fi
 }
 
+# The e2e's target node runs this image and serves its nonce with perl, which
+# perl-base, an Essential package, keeps in it.
+check_perl_socket() {
+  local out
+  if out=$(docker run --rm --user 12345:12345 "$image" perl -MIO::Socket::INET -e1 2>&1); then
+    pass "perl with IO::Socket::INET runs as a non-root user"
+  else
+    fail "perl with IO::Socket::INET, which the e2e target needs: $out"
+  fi
+}
+
 # The agent service runs `sleep infinity` under `init: true` as the profile's
 # user. tini as PID 1 reaps what `docker exec` leaves behind, which a bare
 # `sleep` as PID 1 would leave as zombies.
@@ -377,7 +388,8 @@ check_netguard_fails_loudly() {
   docker volume rm -f "$vol" >/dev/null
 }
 
-checks=(check_identity check_runtime_dirs check_no_agent_proxy check_net_tools check_agent_idle check_dropped check_size)
+checks=(check_identity check_runtime_dirs check_no_agent_proxy check_net_tools check_perl_socket check_agent_idle
+  check_dropped check_size)
 if check_tun; then
   checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_fails_loudly)
 fi
