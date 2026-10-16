@@ -168,10 +168,18 @@ tmpl() {
 
 q() { printf '%q' "$1"; }
 
-# PROBE: a TCP probe, run with python3 on the host and in the agent.
+# unreachable_cmd HOST PORT: a command for the agent that exits 0 only when a
+# TCP connect to HOST:PORT fails with EHOSTUNREACH or ENETUNREACH. A connect,
+# a refusal or a timeout fails it. It uses bash's /dev/tcp, because the image
+# has no python3.
+# shellcheck disable=SC2016 # expands in the agent
+unreachable_cmd() {
+  tmpl 'out=$(timeout 5 bash -c "exec 3<>/dev/tcp/@H@/@P@" 2>&1); rc=$?; printf "rc=%s %s\n" "$rc" "$out"; [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && printf "%s" "$out" | grep -qiE "no route to host|network is unreachable"' H "$1" P "$2"
+}
+
+# PROBE: a TCP probe, run with python3 on the host.
 #   connect HOST PORT              exit 0 when it connects, 1 when refused or
 #                                  unreachable, 2 on a timeout or other error
-#   unreachable HOST PORT          exit 0 only on EHOSTUNREACH or ENETUNREACH
 #   socks HOST PORT PROXY_PORT     SOCKS5 CONNECT through 127.0.0.1:PROXY_PORT
 #   http HOST PORT PROXY_PORT      HTTP CONNECT through 127.0.0.1:PROXY_PORT
 # The proxy modes exit 0 when the proxy connects, 1 when it answers with a
@@ -183,7 +191,7 @@ mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 def done(msg, rc):
     print(msg)
     sys.exit(rc)
-if mode in ("connect", "unreachable"):
+if mode == "connect":
     s = socket.socket()
     s.settimeout(5)
     try:
@@ -191,8 +199,6 @@ if mode in ("connect", "unreachable"):
     except socket.timeout:
         done("timeout", 2)
     name = errno.errorcode.get(r, r) if r else "connected"
-    if mode == "unreachable":
-        done(name, 0 if r in (errno.EHOSTUNREACH, errno.ENETUNREACH) else 1)
     done(name, 0 if r == 0 else (1 if r in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH) else 2))
 try:
     s = socket.create_connection(("127.0.0.1", int(sys.argv[4])), timeout=15)
@@ -607,7 +613,6 @@ a2_agent_reaches_peer() {
   stack_step "the agent lacks NET_ADMIN" 'for f in CapEff CapBnd; do c=$(awk -v f="$f:" "\$1 == f {print \$2}" /proc/self/status); printf "%s=%s\n" "$f" "$c"; [ -n "$c" ] && [ $(( (0x$c >> 12) & 1 )) -eq 0 ] || exit 1; done' || failed=1
   stack_step "the agent has no proxy variables" 'v=$(env | grep -iE "^(all|http|https)_proxy="); printf "%s\n" "$v"; [ -z "$v" ]' || failed=1
   for h in "$TARGET_IP" "$TARGET_NAME"; do
-    stack_step "psql to $h" "$(tmpl 'r=$(PGCONNECT_TIMEOUT=10 psql -h @H@ -U postgres -tAc "select 1"); printf "got=%s\n" "$r"; [ "$r" = 1 ]' H "$h")" || failed=1
     stack_step "nc to $h:5432" "nc -z -w 10 $h 5432" || failed=1
     stack_step "ping $h" "ping -c 2 -W 5 $h" || failed=1
     stack_step "curl http://$h:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@H@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' H "$h" N "$NONCE")" || failed=1
@@ -630,7 +635,7 @@ a3_agent_no_host_tailnet() {
   local failed=0
   host_peer_controls || failed=1
   stack_step "ip route get $HOST_PEER is unreachable" "$(tmpl 'out=$(ip route get @IP@ 2>&1); rc=$?; printf "%s\n" "$out"; [ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qiE "unreachable|no route to host"' IP "$HOST_PEER")" || failed=1
-  stack_step "direct connect to $HOST_PEER:$HOST_PEER_PORT is unreachable" "python3 -I -c $(q "$PROBE") unreachable $HOST_PEER $HOST_PEER_PORT" || failed=1
+  stack_step "direct connect to $HOST_PEER:$HOST_PEER_PORT is unreachable" "$(unreachable_cmd "$HOST_PEER" "$HOST_PEER_PORT")" || failed=1
   stack_step "ping $HOST_PEER fails" "if ping -c 1 -W 3 $HOST_PEER; then echo unexpected-reply; false; else true; fi" || failed=1
   stack_step "tailscale ping $HOST_PEER fails" "if timeout 20 tailscale ping -c 1 --timeout 5s $HOST_PEER; then echo unexpected-pong; false; else true; fi" || failed=1
   stack_step "no host-tailnet peers in tailscale status" "$(tmpl 'tailscale status --json | jq -e --argjson bad @BAD@ --arg sfx @SFX@ "[.Peer[]? | select(any(.TailscaleIPs[]?; . as \$i | any(\$bad[]; . == \$i)) or ((.DNSName // \"\") | endswith(\$sfx)))] | length == 0" >/dev/null || { tailscale status --json | jq -r ".Peer[]? | .DNSName"; false; }' \

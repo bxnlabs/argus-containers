@@ -34,7 +34,7 @@ check_identity() {
   fi
   if [[ -z $user ]]; then pass "default user is root"; else fail "image sets USER=$user"; fi
   if [[ $env != *'"HOME='* ]]; then pass "HOME is not set"; else fail "image sets HOME: $env"; fi
-  if [[ $env == *'"SHELL=/bin/zsh"'* ]]; then pass "SHELL is zsh"; else fail "SHELL is not /bin/zsh: $env"; fi
+  if [[ $env != *'"SHELL='* ]]; then pass "SHELL is not set"; else fail "image sets SHELL: $env"; fi
   # getent exits 2 when the key is not found; any other status is a failure.
   docker run --rm "$image" getent passwd argus >/dev/null
   rc=$?
@@ -46,94 +46,34 @@ check_identity() {
 }
 
 check_runtime_dirs() {
-  local modes
-  modes=$(docker run --rm "$image" stat -c '%a %n' /var/run/tailscale /opt/argus/share/supervisor)
-  if [[ $modes == $'1777 /var/run/tailscale\n1777 /opt/argus/share/supervisor' ]]; then
-    pass "runtime directories are 1777"
+  local mode out
+  mode=$(docker run --rm "$image" stat -c '%a' /var/run/tailscale)
+  if [[ $mode == 1777 ]]; then
+    pass "/var/run/tailscale is 1777"
   else
-    fail "runtime directory modes: $modes"
+    fail "/var/run/tailscale mode: $mode"
   fi
-}
-
-# The agent CLIs must not be able to replace themselves: the image's version
-# is the one that runs.
-check_cli_readonly() {
-  local out
-  if out=$(docker run --rm --user 12345:12345 "$image" sh -c '
-      for p in /opt/argus/bin /opt/argus/lib/node_modules /opt/argus/bin/agy /opt/argus/bin/omp; do
+  # No profile user, even one in group 0, can replace a tool.
+  if out=$(docker run --rm --user 12345:0 "$image" sh -c '
+      for p in /opt/argus /opt/argus/bin /opt/argus/bin/netguard.sh /opt/argus/bin/tailscaled; do
         if [ -w "$p" ]; then echo "$p is writable"; exit 1; fi
       done
-      owned=$(find /opt/argus/lib/node ! -uid 0 | head -n 1)
-      if [ -n "$owned" ]; then echo "$owned is not owned by root"; exit 1; fi
-      # Nothing under /opt/argus is group- or other-writable except the
-      # supervisor runtime directory, which is 1777.
-      loose=$(find /opt/argus -perm /022 ! -type l ! -path /opt/argus/share/supervisor | head -n 5)
-      if [ -n "$loose" ]; then echo "group- or other-writable: $loose"; exit 1; fi
-      grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml || { echo "codex config missing"; exit 1; }' 2>&1); then
-    pass "agent CLIs are read-only to a non-root user; codex update check is off"
-  else
-    fail "agent CLI install is not locked down: $out"
-  fi
-  # A process in group 0 cannot replace the pinned CLIs either.
-  if out=$(docker run --rm --user 12345:0 "$image" sh -c '
-      for p in /opt/argus /opt/argus/bin /opt/argus/share /opt/argus/bin/claude /opt/argus/bin/agy; do
-        if [ -w "$p" ]; then echo "$p is writable"; exit 1; fi
-      done' 2>&1); then
+      loose=$(find /opt/argus -perm /022 ! -type l | head -n 5)
+      if [ -n "$loose" ]; then echo "group- or other-writable: $loose"; exit 1; fi' 2>&1); then
     pass "/opt/argus is read-only to a non-root user in group 0"
   else
-    fail "/opt/argus is writable by group 0: $out"
+    fail "/opt/argus is writable by a non-root user: $out"
   fi
-}
-
-check_update_env() {
-  local env
-  env=$(docker image inspect --format '{{json .Config.Env}}' "$image")
-  if [[ $env == *'"DISABLE_AUTOUPDATER=1"'* && $env == *'"AGY_CLI_DISABLE_AUTO_UPDATE=true"'* ]]; then
-    pass "claude and agy auto-updates are disabled in the image ENV"
-  else
-    fail "auto-update switches missing from image ENV: $env"
-  fi
-}
-
-# supervisord as an arbitrary non-root UID over an empty HOME, as a profile's
-# agent runs it. tailscaled runs in netguard, not here.
-check_supervisord() {
-  local work cid
-  work=$(mktemp -d)
-  mkdir -p "$work/home"
-  chmod 0777 "$work/home"
-  cid=$(docker run -d --user 12345:12345 -e HOME=/home/smoke \
-    -v "$work/home:/home/smoke" \
-    "$image" /usr/bin/supervisord -c /etc/supervisor/supervisord.conf)
-
-  # shellcheck disable=SC2016 # $HOME must expand in the container, not here.
-  if retry 30 docker exec "$cid" sh -c 'test -f "$HOME/.zshrc" && test -L "$HOME/.oh-my-zsh"'; then
-    pass "home-bootstrap seeded an empty HOME"
-  else
-    fail "home-bootstrap did not seed HOME"
-    docker exec "$cid" cat /opt/argus/share/supervisor/home-bootstrap.log
-  fi
-
-  if docker exec "$cid" pgrep -x tailscaled >/dev/null; then
-    fail "supervisord started tailscaled in the agent"
-  else
-    pass "supervisord does not run tailscaled"
-  fi
-
-  docker rm -f "$cid" >/dev/null
-  # Files written by UID 12345 are not removable by the runner's user.
-  docker run --rm -v "$work:/w" "$image" rm -rf /w/home
-  rmdir "$work"
 }
 
 # Routing is native in the stack, so the agent needs no proxy settings.
 check_no_agent_proxy() {
   local out image_env
   if out=$(docker run --rm "$image" sh -c '
-      for f in /opt/argus/bin/wait-proxy /opt/argus/etc/env.sh /etc/supervisor/conf.d/tailscaled.conf; do
+      for f in /opt/argus/bin/wait-proxy /opt/argus/etc/env.sh; do
         if [ -e "$f" ]; then echo "$f exists"; exit 1; fi
       done' 2>&1); then
-    pass "no wait-proxy, env.sh or tailscaled supervisor program"
+    pass "no wait-proxy or env.sh"
   else
     fail "agent proxy leftovers: $out"
   fi
@@ -150,11 +90,68 @@ check_no_agent_proxy() {
 check_net_tools() {
   local out
   if out=$(docker run --rm --user 12345:12345 "$image" sh -c '
-      for c in psql nc ping; do command -v "$c" >/dev/null || { echo "$c is missing"; exit 1; }; done
+      for c in nc ping; do command -v "$c" >/dev/null || { echo "$c is missing"; exit 1; }; done
       ping -c 1 -W 2 127.0.0.1 >/dev/null' 2>&1); then
-    pass "psql, nc and ping are installed; ping works as a non-root user"
+    pass "nc and ping are installed; ping works as a non-root user"
   else
     fail "network tools: $out"
+  fi
+}
+
+# The agent service runs `sleep infinity` under `init: true` as the profile's
+# user. tini as PID 1 reaps what `docker exec` leaves behind, which a bare
+# `sleep` as PID 1 would leave as zombies.
+check_agent_idle() {
+  local cid out
+  if ! cid=$(docker run -d --init --user 12345:12345 "$image" sleep infinity); then
+    fail "cannot start sleep infinity under --init"
+    return
+  fi
+  if out=$(docker exec "$cid" id -u 2>&1) && [[ $out == 12345 ]]; then
+    pass "docker exec into the idle agent works as uid 12345"
+  else
+    fail "docker exec into the idle agent: $out"
+  fi
+  # The backgrounded sleep outlives its shell, so PID 1 inherits it.
+  docker exec "$cid" sh -c 'sleep 1 &' >/dev/null 2>&1
+  sleep 3
+  if out=$(docker exec "$cid" ps -eo stat=,comm= 2>&1) && ! grep -q '^Z' <<<"$out"; then
+    pass "PID 1 reaps orphaned exec children"
+  else
+    fail "zombies or no ps in the idle agent: $out"
+  fi
+  docker rm -f "$cid" >/dev/null
+}
+
+# Tools the image leaves out stay off PATH.
+check_dropped() {
+  local out
+  if out=$(docker run --rm "$image" sh -c '
+      found=""
+      for c in claude codex omp agy node gcloud aws az pulumi kubectl helm k9s supervisord zsh git psql; do
+        command -v "$c" >/dev/null && found="$found $c"
+      done
+      [ -z "$found" ] || { echo "on PATH:$found"; exit 1; }' 2>&1); then
+    pass "no dropped tool is on PATH"
+  else
+    fail "dropped tools are back: $out"
+  fi
+}
+
+# The image's uncompressed size, against a budget about 25% over the size it
+# had when the budget was set: 224 MB on arm64 and 209 MB on amd64.
+size_budget_mb=280
+check_size() {
+  local bytes mb
+  if ! bytes=$(docker image inspect --format '{{.Size}}' "$image"); then
+    fail "cannot inspect $image"
+    return
+  fi
+  mb=$((bytes / 1000000))
+  if ((mb <= size_budget_mb)); then
+    pass "image is $mb MB, within the $size_budget_mb MB budget"
+  else
+    fail "image is $mb MB, over the $size_budget_mb MB budget"
   fi
 }
 
@@ -380,7 +377,7 @@ check_netguard_fails_loudly() {
   docker volume rm -f "$vol" >/dev/null
 }
 
-checks=(check_identity check_runtime_dirs check_cli_readonly check_update_env check_supervisord check_no_agent_proxy check_net_tools)
+checks=(check_identity check_runtime_dirs check_no_agent_proxy check_net_tools check_agent_idle check_dropped check_size)
 if check_tun; then
   checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_fails_loudly)
 fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run each CLI's version command in the image. A tool pinned in the Dockerfile
+# Run each tool's version command in the image. A tool pinned in the Dockerfile
 # must report its pinned version.
 # Usage: smoke-versions IMAGE PLATFORM
 set -uo pipefail
@@ -9,13 +9,9 @@ platform=${2:?usage: smoke-versions IMAGE PLATFORM}
 dockerfile=${DOCKERFILE:-$(cd "$(dirname "$0")/../.." && pwd)/Dockerfile}
 failures=0
 
-# expected PIN: print the pinned version named by PIN. PIN is an ARG name, or
-# FROM:alpine/k8s for the tag kubectl comes from.
+# expected PIN: print the pinned version named by PIN, an ARG name.
 expected() {
-  case $1 in
-    FROM:alpine/k8s) sed -n 's|^FROM alpine/k8s:\([^@ ]*\).*|\1|p' "$dockerfile" ;;
-    *) sed -n "s/^ARG $1=//p" "$dockerfile" ;;
-  esac
+  sed -n "s/^ARG $1=//p" "$dockerfile"
 }
 
 # check NAME PIN CMD...: run CMD in the image. PIN is "-" for a tool with no
@@ -46,27 +42,8 @@ check() {
   echo "PASS $name: $(head -n1 <<<"$out")"
 }
 
-check tailscale   TAILSCALE_VERSION tailscale version
-check tailscaled  TAILSCALE_VERSION tailscaled --version
-check pulumi      PULUMI_VERSION    pulumi version
-check gcloud      GCLOUD_VERSION    gcloud version
-check gsutil      -                 gsutil version
-check bq          -                 bq version
-check gke-auth    -                 gke-gcloud-auth-plugin --version
-check kubectl     FROM:alpine/k8s   kubectl version --client
-check helm        -                 helm version --short
-check k9s         K9S_VERSION       k9s version --short
-check aws         AWSCLI_VERSION    aws --version
-check aws-help    -                 sh -c 'PAGER=cat aws s3 help >/tmp/help && head -n 1 /tmp/help'
-check az          AZURE_CLI_VERSION az version --query '"azure-cli"' --output tsv
-check supervisord -                 supervisord --version
-check zsh         -                 zsh --version
-check node        NODE_VERSION        node --version
-check npm         -                   npm --version
-check claude      CLAUDE_CODE_VERSION claude --version
-check codex       CODEX_VERSION       codex --version
-check agy         AGY_VERSION         agy --version
-check omp         OMP_VERSION         omp --version
+check tailscale  TAILSCALE_VERSION tailscale version
+check tailscaled TAILSCALE_VERSION tailscaled --version
 
 if ((failures)); then
   echo "$failures version check(s) failed on $platform"

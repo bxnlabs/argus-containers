@@ -4,15 +4,12 @@ Container images for [Argus](https://github.com/bxnlabs/argus) dockerized profil
 
 ## `ghcr.io/bxnlabs/argus-containers/profile:main`
 
-A base image with everything a dockerized Argus profile needs:
+The base image for a dockerized Argus profile's compose stack. Sessions run on the host, so the stack has two jobs, and the image holds only what they need:
 
-- Ubuntu 26.04 with a development tool set (build-essential, git, jq, python3, tmux, vim, zsh and more), plus `psql`, `nc` and `ping` for raw tailnet traffic.
-- tailscale and tailscaled, pulumi, gcloud (with gsutil, bq and gke-gcloud-auth-plugin), aws, az, kubectl, helm, k9s and oh-my-zsh.
-- The agent CLIs Argus supports: `claude`, `codex`, `agy` (Antigravity) and `omp` (oh-my-pi), plus Node.js for the npm-distributed ones.
-- A supervisord configuration that seeds `$HOME`.
-- `/opt/argus/bin/netguard.sh`, the entrypoint of a profile's `netguard` service. It guards the network and runs tailscaled in TUN mode, with an HTTP and SOCKS5 proxy on port 1055. See [Networking](#networking).
+- `netguard` guards the network and runs tailscaled in TUN mode, with an HTTP and SOCKS5 proxy on port 1055. The image has tailscale, tailscaled and `/opt/argus/bin/netguard.sh`, the service's entrypoint. See [Networking](#networking).
+- `agent` is where `argus profile exec --compose` runs tools that need the profile's tailnet natively. The image has `nc`, `ping`, `curl` and `jq` for that, plus the `tailscale` CLI.
 
-Tools live under `/opt/argus`, which is on `PATH` for every process in the container. The image sets `SHELL=/bin/zsh`, so Argus shell sessions start a zsh login shell.
+Underneath is Ubuntu 26.04, with no agent CLIs, cloud CLIs or development tools. Tools live under `/opt/argus`, which is on `PATH` for every process in the container.
 
 The image has **no user**. It runs as root and does not set `HOME`. Argus runs a profile's agent as the host's user, which a published image cannot know, so each profile adds its own.
 
@@ -53,7 +50,7 @@ RUN set -eux; \
     if getent passwd "$ARGUS_USER"  >/dev/null; then userdel  "$ARGUS_USER";  fi; \
     if getent group  "$ARGUS_GROUP" >/dev/null; then groupdel "$ARGUS_GROUP"; fi; \
     groupadd -g "$ARGUS_GID" "$ARGUS_GROUP"; \
-    useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /usr/bin/zsh "$ARGUS_USER"
+    useradd -u "$ARGUS_UID" -g "$ARGUS_GID" -d "$ARGUS_HOST_HOME" -M -s /bin/bash "$ARGUS_USER"
 ENV HOME=$ARGUS_HOST_HOME USER=$ARGUS_USER
 USER $ARGUS_USER
 ```
@@ -115,7 +112,8 @@ services:
       - ${ARGUS_HOST_HOME}/Workspace:${ARGUS_HOST_HOME}/Workspace   # real Workspace
       - ${ARGUS_STATE_DIR}:${ARGUS_STATE_DIR}                       # Argus state root
       - ts-sock:/var/run/tailscale                                  # tailscale CLI
-    command: ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+    init: true                    # reaps what `docker exec` leaves behind
+    command: ["sleep", "infinity"]
 ```
 
 The service Argus runs sessions in must be named `agent`. `netguard` uses the same `build` block, not `image: ghcr.io/…/profile:main`. That way both services always run the same locally built image, and it changes only when you run `argus profile up`.
@@ -153,7 +151,7 @@ hooks/
 
 ### Host directories
 
-Create `.home` and `.tailscale` as yourself before the first start. If `.home` is missing, Docker creates it owned by root, and the profile user can't seed it. tailscaled runs in `netguard` as a root without `DAC_OVERRIDE`, so on Linux it can't use a directory another user owns: hand `.tailscale` to root, through a container so it needs no `sudo`:
+Create `.home` and `.tailscale` as yourself before the first start. If `.home` is missing, Docker creates it owned by root, and the profile user can't write to it. tailscaled runs in `netguard` as a root without `DAC_OVERRIDE`, so on Linux it can't use a directory another user owns: hand `.tailscale` to root, through a container so it needs no `sudo`:
 
 ```sh
 mkdir -p .home .tailscale
@@ -161,15 +159,15 @@ docker run --rm -v "$PWD/.tailscale:/s" ghcr.io/bxnlabs/argus-containers/profile
   sh -c 'chown -R 0:0 /s && chmod 0700 /s'
 ```
 
-Run the same `docker run` in a profile that kept its `.tailscale` from before tailscaled moved into `netguard`; that state belongs to the profile user. On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
+On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
 
-### First start and agent logins
+### First start
 
 ```sh
 argus profile up <name>
 ```
 
-Sessions run on the host, so agents use the host user's own credentials and settings in the host's `$HOME`, not the image or the profile's `.home`. If you haven't logged in to an agent on the host yet, open a shell session in the profile and log in once (`claude`, `codex login`, `agy`, `omp`). The profile's `.home` is the `$HOME` of commands run with `argus profile exec --compose`.
+Sessions run on the host, so agents use the host user's own installs, credentials and settings in the host's `$HOME`, not the image or the profile's `.home`. The profile's `.home` is the `$HOME` of commands run with `argus profile exec --compose`.
 
 To join a tailnet, run `argus profile exec --compose <name> -- tailscale up`. The login persists in `.tailscale/`.
 
@@ -222,7 +220,7 @@ Remove the `@sha256:…` pin to follow `:main` again.
 
 tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
-- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- psql -h db-host …`. Raw-TCP tools that can't use a proxy, such as `psql`, must run this way, which is why the image ships `psql`, `nc` and `ping`. Add other clients to the profile's Dockerfile.
+- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- nc -z db-host 5432`. Raw-TCP tools that can't use a proxy must run this way. The image ships `nc`, `ping`, `curl`, `jq` and `tailscale` for this; anything beyond them, such as `psql`, goes in the profile's own Dockerfile.
 - **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. The hook exports its address as `ARGUS_TAILNET_PROXY`, and only the tools you point at it use it:
 
   - **kubectl:** set `proxy-url` on each tailnet cluster in the kubeconfig:
@@ -272,35 +270,16 @@ If the host accepts subnet routes from its tailnet, add those prefixes to `NETGU
 
 **If `netguard` restarts while the agent keeps running,** the agent stays in the old namespace with only `lo`. This fails closed: tailnet and internet are both cut, and no path to the host tailnet opens. `tailscale status` in the agent still looks healthy, because the socket reaches the new tailscaled. `argus profile up` and `docker compose up -d` do not repair a restart, because Compose leaves an unchanged running agent attached to the old namespace. Restart the agent: `docker compose -p argus-<name> restart agent` (with the variables Argus passes, as in [Updating a profile](#updating-a-profile)), or stop the profile's sessions and run `argus profile down <name>` and `argus profile up <name>`. After a *recreate* of `netguard`, the next `up` recreates the agent too.
 
-## Agent CLI versions
-
-Each agent CLI is pinned by an `ARG` in the `Dockerfile` and runs at exactly that version:
-
-- `claude`: `DISABLE_AUTOUPDATER=1` in the image environment.
-- `codex`: `check_for_update_on_startup = false` in `/etc/codex/config.toml`.
-- `agy`: `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the image environment (it ignores `1`).
-- `omp`: updates itself only on an explicit `omp update`.
-
-`/opt/argus` is owned by root, so the profile user cannot replace any of them. New versions arrive with image updates.
-
 ## Version updates
 
-Renovate keeps the image current and automerges once CI passes. CI builds both architectures and checks that every pinned tool reports its pinned version.
+Renovate keeps the image current and automerges once CI passes. CI builds both architectures, checks that tailscale and tailscaled report the pinned version, and fails when the image grows past its size budget in `.github/scripts/smoke-runtime`.
 
 | Dependency | How it is updated |
 |---|---|
-| `ubuntu`, `alpine/k8s` (kubectl, helm) | Renovate, digest-pinned |
-| tailscale, pulumi, k9s, omp | Renovate, GitHub releases |
-| aws | Renovate, GitHub tags |
-| az | Renovate, PyPI |
-| claude, codex | Renovate, npm |
-| Node.js | Renovate within the current major; move majors by hand |
-| gcloud | Renovate, through a custom datasource over Google's rapid-channel `components-2.json` |
-| agy | By hand: run `.github/scripts/agy-latest` and paste its four `ARG` lines over the `AGY_*` ARGs |
+| `ubuntu` | Renovate, digest-pinned |
+| tailscale | Renovate, GitHub releases |
 | GitHub Actions | Renovate |
-| apt packages, oh-my-zsh | Not pinned: apt packages come from the pinned Ubuntu base's archive at build time; oh-my-zsh is cloned from its default branch |
-
-When Argus supports a new agent CLI, add it to the image and to `.github/scripts/smoke-versions`.
+| apt packages | Not pinned: they come from the pinned Ubuntu base's archive at build time |
 
 ## Tailnet-separation e2e
 
