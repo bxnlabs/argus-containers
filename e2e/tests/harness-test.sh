@@ -143,6 +143,41 @@ ok grep -qx "exec -T netguard tailscale status --json" "$tmp/calls"
 ok grep -q "restart -t 5 agent" "$tmp/calls"
 rm -rf "$tmp"
 
+# A10 passes only when netguard turns healthy with the same start time and
+# the operator, and the agent logs in again. It tries the login even after a
+# failed check.
+for case in pass:0 restarted:1 unhealthy:1 operator:1 up-fails:1; do
+  tmp=$(mktemp -d)
+  out=$(MODE=${case%%:*} LOG=$tmp/calls bash -c '
+    . "$1"
+    DEADLINE=0 TS_OPERATOR=jeev AGENT_HOST=argus-e2e-agent-1a2b3c4d CHECK_OUT=""
+    log() { :; }
+    sleep() { :; }
+    timeout() { shift; "$@"; }
+    docker() {
+      if [[ $MODE == restarted && -e $LOG ]]; then echo t2; else echo t1; fi
+    }
+    compose() {
+      case "$*" in
+        "ps -q netguard") echo cid ;;
+        "exec -T netguard /opt/argus/bin/netguard.sh --check") [[ $MODE != unhealthy ]] ;;
+        "exec -T netguard tailscale debug prefs")
+          if [[ $MODE == operator ]]; then echo "{}"; else echo "{\"OperatorUser\":\"jeev\"}"; fi ;;
+        *) return 1 ;;
+      esac
+    }
+    in_stack() {
+      printf "%s\n" "${*: -1}" >>"$LOG"
+      OUT=""
+      [[ $MODE != up-fails || ${*: -1} != *"tailscale up"* ]]
+    }
+    agent_logged_in() { :; }
+    a10_heals_after_logout; echo "rc=$?"' _ "$here/../tailnet-separation.sh" 2>/dev/null)
+  eq "a10: ${case%%:*}" "rc=${case#*:}" "$(tail -n 1 <<<"$out")"
+  ok grep -q "tailscale up --auth-key=file:/run/secrets/authkey --hostname=argus-e2e-agent-1a2b3c4d" "$tmp/calls"
+  rm -rf "$tmp"
+done
+
 # teardown survives a second signal: TERM during the agent logout must not
 # stop it before the target logout.
 tmp=$(mktemp -d)

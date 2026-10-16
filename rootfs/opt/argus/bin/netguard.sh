@@ -29,7 +29,9 @@
 # without root (tailscale set --operator). Unset means only root may, and
 # clears an operator saved by an earlier start. When the operator is not in
 # effect, the healthcheck fails, so the agent, which waits for a healthy
-# netguard, never starts with read-only access.
+# netguard, never starts with read-only access. `tailscale logout` resets the
+# operator, so netguard checks it every 5 seconds for as long as tailscaled
+# runs, and sets it again.
 set -euo pipefail
 
 sock=/var/run/tailscale/tailscaled.sock
@@ -66,6 +68,14 @@ tailscaled_answers() {
   timeout 5 tailscale --socket="$sock" status --json >/dev/null 2>&1
 }
 
+# operator_pref: tailscaled's operator, or nothing when it has none. Fails
+# when tailscaled doesn't answer.
+operator_pref() {
+  local prefs
+  prefs=$(timeout 5 tailscale --socket="$sock" debug prefs 2>/dev/null) || return 1
+  jq -r '.OperatorUser // empty' <<<"$prefs"
+}
+
 # operator_in_effect: tailscaled's operator is NETGUARD_TS_OPERATOR, which
 # names a user here, or it has none when that is unset. tailscaled accepts any
 # name, and resolves it to a uid only when a client connects, so both halves
@@ -76,7 +86,10 @@ operator_in_effect() {
     echo "netguard: operator $operator is not a user in this image" >&2
     return 1
   fi
-  got=$(timeout 5 tailscale --socket="$sock" debug prefs 2>/dev/null | jq -r '.OperatorUser // empty')
+  if ! got=$(operator_pref); then
+    echo "netguard: cannot read tailscaled's prefs" >&2
+    return 1
+  fi
   if [[ $got != "$operator" ]]; then
     echo "netguard: tailscaled's operator is '$got', not '$operator'" >&2
     return 1
@@ -143,6 +156,27 @@ done
 if operator_in_effect 2>/dev/null; then
   echo "netguard: ${operator:-only root} may control tailscaled"
 fi
+
+# keep_operator: set the operator again whenever it changes, until tailscaled
+# exits. `tailscale logout` resets tailscaled's prefs, the operator included,
+# which would leave the agent read-only and unable to log back in. Only the
+# setting is repaired here; a name that is not a user stays the healthcheck's
+# to report.
+keep_operator() {
+  local got
+  while kill -0 "$tsd" 2>/dev/null; do
+    sleep 5
+    got=$(operator_pref) || continue
+    [[ $got == "$operator" ]] && continue
+    tailscale --socket="$sock" set --operator="$operator" 2>/dev/null || continue
+    if [[ -n $operator ]]; then
+      echo "netguard: tailscaled's operator was '$got' (tailscale logout resets it); set it back to '$operator'"
+    else
+      echo "netguard: tailscaled's operator was '$got'; cleared it, so only root may control tailscaled"
+    fi
+  done
+}
+keep_operator &
 
 # wait returns early when a trapped signal arrives; wait again for tailscaled
 # to finish its own shutdown, and exit with its status.

@@ -262,7 +262,7 @@ Traffic from the stack also has an ordinary path through the Docker bridge and t
 
 `netguard.sh` closes that path before it starts tailscaled. It adds an `unreachable` route for each prefix in `NETGUARD_TAILNET_PREFIXES` (default `100.64.0.0/10`) to the namespace's main routing table, and it requires IPv6 to be disabled. It re-adds the routes on every start, because each start gets a new namespace. tailscaled puts a route for each of the profile's peers into its own table 52, which the kernel consults before the main table. So the profile's peers are reachable, and every other tailnet address hits the guard. That holds for tailscaled's own connections too, so the published proxy can't reach the host's tailnet either.
 
-The agent's default capabilities do not include `NET_ADMIN`, so session processes cannot change the routes. The guard is not a security boundary: the agent is trusted, as it is on the host. The agent shares tailscaled's socket and is its operator, so it has full control of tailscaled: it can run `tailscale up`, `down` and `logout`, accept subnet routes, pick an exit node, or `serve`. Through those it can change the stack's routing without `NET_ADMIN`.
+The agent's default capabilities do not include `NET_ADMIN`, so session processes cannot change the routes. The guard is not a security boundary: the agent is trusted, as it is on the host. The agent shares tailscaled's socket and is its operator, so it has full control of tailscaled: it can run `tailscale up`, `down` and `logout`, accept subnet routes, pick an exit node, or `serve`. Through those it can change the stack's routing without `NET_ADMIN`. `tailscale logout` also resets tailscaled's operator; `netguard` sets it back within about 5 seconds, so the agent can log in again without a restart.
 
 `netguard` needs only `NET_ADMIN` and `/dev/net/tun`. With tailscaled's default firewall backend, iptables, it would also need `NET_RAW`; `TS_DEBUG_FIREWALL_MODE: nftables` avoids that. `net.ipv4.conf.all.src_valid_mark` is set as a service sysctl because tailscaled can't set it inside a container.
 
@@ -288,7 +288,7 @@ Renovate keeps the image current and automerges once CI passes. CI builds both a
 ### Prerequisites (once)
 
 1. Create a new tailnet for this test, separate from the host's. Keep MagicDNS enabled (the default).
-2. Create an auth key that is **reusable** (the run enrolls two nodes), **ephemeral** (logging out removes a node) and **pre-approved**. Write it to a file with mode `0600`.
+2. Create an auth key that is **reusable** (the run enrolls the target once and the profile twice), **ephemeral** (logging out removes a node) and **pre-approved**. Write it to a file with mode `0600`.
 3. Pick one peer on the host's tailnet that answers on TCP port 22 from the host. It is the only host-tailnet address the run probes.
 
 The profile must follow the recipe above, with three additions to its `compose.yaml`: a secret named `authkey` that holds the key file, mounted into the agent,
@@ -315,4 +315,4 @@ The profile's hook must follow the recipe: it exports `ARGUS_TAILNET_PROXY` and 
 
 Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `realpath` (GNU), `python3`, and a host `tailscale` CLI connected to the host's tailnet. It runs on macOS and Linux.
 
-The script prints one `PASS` or `FAIL` line per assertion (A1–A9). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (accepted subnet routes, or an exit node). A8 restarts and recreates `netguard`. Concurrent runs are not supported. Teardown logs both nodes out on every exit, reports its own failures, and does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
+The script prints one `PASS` or `FAIL` line per assertion (A1–A10). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (accepted subnet routes, or an exit node). A8 restarts and recreates `netguard`. A10 logs the profile out and back in. Concurrent runs are not supported. Teardown logs both nodes out on every exit, reports its own failures, and does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
