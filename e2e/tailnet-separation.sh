@@ -14,6 +14,9 @@
 # reusable (the run enrolls two nodes), ephemeral (logout removes them) and
 # pre-approved. The script never reads it.
 #
+# The profile's post_create hook must follow the README's recipe: it exports
+# ARGUS_TAILNET_PROXY and no session-wide proxy variables. A7 checks both.
+#
 # Exit status: 0 when every assertion passes, 1 when any fails, and 2 when the
 # run aborts before its assertions.
 set -uo pipefail
@@ -230,7 +233,7 @@ parse_args() {
         shift
         ;;
       -h | --help)
-        sed -n '2,18p' "$0"
+        sed -n '2,21p' "$0"
         exit 0
         ;;
       *) die "unknown argument: $1" ;;
@@ -677,10 +680,11 @@ a6_host_proxy_no_host_tailnet() {
 }
 
 # shellcheck disable=SC2016 # these commands expand in the hooked host shell
-a7_hook_points_at_proxy() {
+a7_hook_exports_tailnet_proxy() {
   local failed=0
-  hooked_step "the hook exports the proxy variables" "$(tmpl 'n=$(env | grep -cxE "(ALL|all|HTTP|http|HTTPS|https)_PROXY=http://127\.0\.0\.1:@P@|(ALL|all|HTTP|http|HTTPS|https)_proxy=http://127\.0\.0\.1:@P@"); printf "proxy_vars=%s\n" "$n"; [ "$n" -eq 6 ] && env | grep -qx "NO_PROXY=localhost,127.0.0.1,::1"' P "$PROXY_PORT")" || failed=1
-  hooked_step "curl http://$TARGET_NAME:8080/ with the hook's environment" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET_NAME" N "$NONCE")" || failed=1
+  hooked_step "ARGUS_TAILNET_PROXY is http://127.0.0.1:$PROXY_PORT" "$(tmpl 'printf "ARGUS_TAILNET_PROXY=%s\n" "${ARGUS_TAILNET_PROXY-(unset)}"; [ "${ARGUS_TAILNET_PROXY-}" = http://127.0.0.1:@P@ ]' P "$PROXY_PORT")" || failed=1
+  hooked_step "no session-wide proxy variables" 'v=$(env | grep -iE "^(all|http|https)_proxy="); printf "%s\n" "$v"; [ -z "$v" ]' || failed=1
+  hooked_step "curl -x \$ARGUS_TAILNET_PROXY http://$TARGET_NAME:8080/" "$(tmpl '[ -n "${ARGUS_TAILNET_PROXY-}" ] || { echo "ARGUS_TAILNET_PROXY is unset"; exit 1; }; r=$(curl -fsS --max-time 15 -x "$ARGUS_TAILNET_PROXY" http://@T@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' T "$TARGET_NAME" N "$NONCE")" || failed=1
   return "$failed"
 }
 
@@ -766,7 +770,7 @@ run_assertions() {
   assert A4 "the agent's internet egress works" a4_agent_internet
   assert A5 "the host proxy reaches the client tailnet and the internet" a5_host_proxy_reaches_peer
   assert A6 "the host proxy cannot reach the host tailnet" a6_host_proxy_no_host_tailnet
-  assert A7 "the post_create hook points host-side commands at the proxy" a7_hook_points_at_proxy
+  assert A7 "the post_create hook exports ARGUS_TAILNET_PROXY and nothing session-wide" a7_hook_exports_tailnet_proxy
   assert A8 "the node keeps its identity across a netguard restart and recreate" a8_identity_and_restart
   assert A9 "the host is unaffected" a9_host_unaffected
 }

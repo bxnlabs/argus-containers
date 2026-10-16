@@ -130,31 +130,15 @@ Argus passes `ARGUS_HOST_HOME`, `ARGUS_STATE_DIR`, `ARGUS_UID` and `ARGUS_GID` t
 
 ### hooks/post_create.sh
 
-Sessions run on the host, and Argus sources this hook in bash before starting an agent, before a shell session's login shell, and for `argus profile exec`. It points the session's HTTP and SOCKS clients at the profile's proxy:
+Sessions run on the host, and Argus sources this hook in bash before starting an agent, before a shell session's login shell, and for `argus profile exec`. It tells the session where the profile's tailnet proxy is, and points nothing at it:
 
 ```sh
-ARGUS_PROXY=http://127.0.0.1:10551   # the port netguard publishes
-export ALL_PROXY=$ARGUS_PROXY all_proxy=$ARGUS_PROXY
-export HTTP_PROXY=$ARGUS_PROXY http_proxy=$ARGUS_PROXY
-export HTTPS_PROXY=$ARGUS_PROXY https_proxy=$ARGUS_PROXY
-export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
-unset ARGUS_PROXY
-
-# Argus brings the stack up before the hook runs, but tailscaled can still be
-# starting. Any HTTP answer means its proxy is up; a bare connect proves
-# nothing, because Docker's port proxy accepts before anything listens behind
-# it. Wait up to 10 seconds, then start the session anyway.
-i=0
-until curl -s -o /dev/null --max-time 1 --noproxy '*' http://127.0.0.1:10551/; do
-  i=$((i + 1))
-  if [ "$i" -ge 20 ]; then
-    echo "[post_create] the tailnet proxy on 127.0.0.1:10551 is not up yet" >&2
-    break
-  fi
-  sleep 0.5
-done
-unset i
+export ARGUS_TAILNET_PROXY=http://127.0.0.1:10551   # the port netguard publishes
 ```
+
+Tools that need the tailnet use the proxy explicitly (see [Networking](#networking)), and everything else goes out directly. The hook doesn't wait for the proxy, because a session shouldn't block on a proxy it may never use.
+
+The hook doesn't export `ALL_PROXY` or `HTTP(S)_PROXY` on purpose. Those would send every HTTP client in the session through `netguard`, including the agent's own API traffic, `git`, `gh` and package managers. The session's network would then depend on the stack being up and healthy. And because the agent is tailscaled's operator, a single `tailscale set --exit-node` would route all of it through the profile's tailnet.
 
 The hook is sourced, so it must not `exit`. Neither session path reads `~/.zshrc` first, so anything agents need in their environment must come from the hook.
 
@@ -239,13 +223,36 @@ Remove the `@sha256:…` pin to follow `:main` again.
 tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
 - **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- psql -h db-host …`. Raw-TCP tools that can't use a proxy, such as `psql`, must run this way, which is why the image ships `psql`, `nc` and `ping`. Add other clients to the profile's Dockerfile.
-- **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. Clients that honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (curl, kubectl, gh, most CLIs and SDKs) work unchanged, because the hook sets them. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. For SSH, use the proxy as a SOCKS5 proxy:
+- **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. The hook exports its address as `ARGUS_TAILNET_PROXY`, and only the tools you point at it use it:
 
-  ```sh
-  ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10551 %h %p' user@host
-  ```
+  - **kubectl:** set `proxy-url` on each tailnet cluster in the kubeconfig:
+
+    ```yaml
+    clusters:
+      - name: my-cluster
+        cluster:
+          server: https://k8s-api.example.ts.net:6443
+          proxy-url: http://127.0.0.1:10551
+    ```
+
+  - **SSH:** use the proxy as a SOCKS5 proxy, in a `Host` block in `~/.ssh/config`:
+
+    ```
+    Host *.example.ts.net
+      ProxyCommand nc -X 5 -x 127.0.0.1:10551 %h %p
+    ```
+
+    or for one connection:
+
+    ```sh
+    ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10551 %h %p' user@host
+    ```
+
+  - **One-off commands:** `HTTPS_PROXY=$ARGUS_TAILNET_PROXY gh api …`, or `curl -x "$ARGUS_TAILNET_PROXY" …`.
 
   The host's own `tailscale nc` talks to the host's tailnet, not the profile's.
+
+  **When the stack is down,** sessions still start (bxnlabs/argus#235), and only the commands pointed at the proxy fail.
 
 **DNS.** With its default `--accept-dns`, tailscaled rewrites `netguard`'s `/etc/resolv.conf` to use MagicDNS (100.100.100.100), and Docker gives the agent the same file. Short names, tailnet FQDNs and internet names all resolve in the agent with no `dns:` setting.
 
@@ -317,13 +324,15 @@ services:
     secrets: [authkey]
 ```
 
-and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run). The hook must export the proxy variables as in the recipe.
+and a `.tailscale` directory that is logged out (or holds only a login left by an earlier e2e run).
 
 ### Running it
 
 ```sh
 e2e/tailnet-separation.sh --profile acme-test --host-peer 100.x.y.z
 ```
+
+The profile's hook must follow the recipe: it exports `ARGUS_TAILNET_PROXY` and no session-wide proxy variables. A7 checks both, and fails against a hook that sets them.
 
 Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `realpath` (GNU), `python3`, and a host `tailscale` CLI connected to the host's tailnet. It runs on macOS and Linux.
 

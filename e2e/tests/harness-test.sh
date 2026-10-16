@@ -157,6 +157,60 @@ LOG=$tmp/steps bash -c '
 eq "teardown: both logouts after a second signal" $'agent\ntarget' "$(cat "$tmp/steps" 2>/dev/null)"
 rm -rf "$tmp"
 
+# A7 against hooks sourced in an empty environment, with a stand-in proxy
+# that answers only a proxied request for the target. The recipe's hook comes
+# from README.md, so the recipe and A7 can't drift apart.
+tmp=$(mktemp -d)
+python3 -I -c '
+import http.server, os, sys
+target, nonce, portfile = sys.argv[1:4]
+class Proxy(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.path == "http://%s:8080/" % target
+        body = (nonce if ok else "not a proxied request for the target").encode()
+        self.send_response(200 if ok else 502)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Proxy)
+with open(portfile + ".tmp", "w") as f:
+    f.write(str(server.server_port))
+os.replace(portfile + ".tmp", portfile)
+server.serve_forever()' a7-target.invalid a7-nonce "$tmp/port" &
+proxy_pid=$!
+for _ in $(seq 50); do
+  [[ -s $tmp/port ]] && break
+  sleep 0.1
+done
+port=$(cat "$tmp/port")
+recipe_hook=$(awk '/^### hooks\/post_create\.sh$/ { h = 1 } h && /^```sh$/ { c = 1; next } c && /^```$/ { exit } c' "$here/../../README.md")
+
+# a7_with_hook HOOK: A7's verdict when the profile's hook is HOOK.
+a7_with_hook() {
+  printf '%s\n' "$1" >"$tmp/hook.sh"
+  PROXY_PORT=$port TARGET_NAME=a7-target.invalid NONCE=a7-nonce HOOK=$tmp/hook.sh bash -c '
+    . "$1"
+    # The command runs in a child of the shell that sourced the hook, as it
+    # does under `argus profile exec`, so it sees only exported variables.
+    # shellcheck disable=SC2016 # expands in the inner shell
+    on_host_hooked() { OUT=$(env -i PATH="$PATH" bash -c ". \"\$1\"; exec bash -c \"\$2\"" _ "$HOOK" "$1" 2>&1); }
+    if a7_hook_exports_tailnet_proxy; then echo pass; else echo fail; fi' _ "$here/../tailnet-separation.sh"
+}
+# shellcheck disable=SC2016 # the hooks expand when sourced
+{
+  eq "a7: README.md has a recipe hook" yes "$([[ -n $recipe_hook ]] && echo yes)"
+  eq "a7: the recipe's hook" pass "$(a7_with_hook "${recipe_hook//10551/$port}")"
+  eq "a7: a session-wide hook" fail "$(a7_with_hook "p=http://127.0.0.1:$port"'
+export ALL_PROXY=$p all_proxy=$p HTTP_PROXY=$p http_proxy=$p HTTPS_PROXY=$p https_proxy=$p')"
+  eq "a7: one session-wide variable as well" fail "$(a7_with_hook "export ARGUS_TAILNET_PROXY=http://127.0.0.1:$port https_proxy=http://127.0.0.1:$port")"
+  eq "a7: an unexported assignment" fail "$(a7_with_hook "ARGUS_TAILNET_PROXY=http://127.0.0.1:$port")"
+  eq "a7: the wrong port" fail "$(a7_with_hook "export ARGUS_TAILNET_PROXY=http://127.0.0.1:1$port")"
+}
+kill "$proxy_pid"
+rm -rf "$tmp"
+
 # tmpl keeps & and backslashes in values literally.
 eq "tmpl" 'curl http://a&b\c:8080/ -o x' "$(tmpl 'curl http://@H@:@P@/ -o x' H 'a&b\c' P 8080)"
 
