@@ -44,7 +44,6 @@ check() {
 
 check tailscale  TAILSCALE_VERSION tailscale version
 check tailscaled TAILSCALE_VERSION tailscaled --version
-check psql       -                 psql --version
 
 if ((failures)); then
   echo "$failures version check(s) failed on $platform"

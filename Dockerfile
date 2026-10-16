@@ -13,9 +13,9 @@ ENV ARGUS_TOOLS=/opt/argus
 ENV PATH=${ARGUS_TOOLS}/bin:${PATH}
 
 # No iptables: tailscaled in netguard runs its firewall in nftables mode, over
-# netlink. iproute2 is for the network guard. iputils-ping, netcat-openbsd and
-# postgresql-client are for raw tailnet traffic from the agent, which routes
-# to the tailnet natively. procps gives the agent ps and pkill.
+# netlink. iproute2 is for the network guard. iputils-ping and netcat-openbsd
+# are for raw tailnet traffic from the agent, which routes to the tailnet
+# natively. procps gives the agent ps and pkill.
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install --no-install-recommends --yes \
@@ -25,7 +25,6 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
         iputils-ping \
         jq \
         netcat-openbsd \
-        postgresql-client \
         procps \
     && rm -rf /var/lib/apt/lists/*
 

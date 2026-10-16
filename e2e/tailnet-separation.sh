@@ -613,7 +613,6 @@ a2_agent_reaches_peer() {
   stack_step "the agent lacks NET_ADMIN" 'for f in CapEff CapBnd; do c=$(awk -v f="$f:" "\$1 == f {print \$2}" /proc/self/status); printf "%s=%s\n" "$f" "$c"; [ -n "$c" ] && [ $(( (0x$c >> 12) & 1 )) -eq 0 ] || exit 1; done' || failed=1
   stack_step "the agent has no proxy variables" 'v=$(env | grep -iE "^(all|http|https)_proxy="); printf "%s\n" "$v"; [ -z "$v" ]' || failed=1
   for h in "$TARGET_IP" "$TARGET_NAME"; do
-    stack_step "psql to $h" "$(tmpl 'r=$(PGCONNECT_TIMEOUT=10 psql -h @H@ -U postgres -tAc "select 1"); printf "got=%s\n" "$r"; [ "$r" = 1 ]' H "$h")" || failed=1
     stack_step "nc to $h:5432" "nc -z -w 10 $h 5432" || failed=1
     stack_step "ping $h" "ping -c 2 -W 5 $h" || failed=1
     stack_step "curl http://$h:8080/" "$(tmpl 'r=$(curl -fsS --max-time 15 http://@H@:8080/); printf "got=%s\n" "$r"; [ "$r" = @N@ ]' H "$h" N "$NONCE")" || failed=1

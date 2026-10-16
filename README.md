@@ -7,7 +7,7 @@ Container images for [Argus](https://github.com/bxnlabs/argus) dockerized profil
 The base image for a dockerized Argus profile's compose stack. Sessions run on the host, so the stack has two jobs, and the image holds only what they need:
 
 - `netguard` guards the network and runs tailscaled in TUN mode, with an HTTP and SOCKS5 proxy on port 1055. The image has tailscale, tailscaled and `/opt/argus/bin/netguard.sh`, the service's entrypoint. See [Networking](#networking).
-- `agent` is where `argus profile exec --compose` runs tools that need the profile's tailnet natively. The image has `psql`, `nc`, `ping`, `curl` and `jq` for that, plus the `tailscale` CLI.
+- `agent` is where `argus profile exec --compose` runs tools that need the profile's tailnet natively. The image has `nc`, `ping`, `curl` and `jq` for that, plus the `tailscale` CLI.
 
 Underneath is Ubuntu 26.04, with no agent CLIs, cloud CLIs or development tools. Tools live under `/opt/argus`, which is on `PATH` for every process in the container.
 
@@ -204,7 +204,7 @@ Migrate each profile in this order:
 1. On the image the profile has now, give `agent` `init: true` and `command: ["sleep", "infinity"]` in `compose.yaml`, and change the Dockerfile's `useradd -s` to `/bin/bash`. Run `argus profile up <name>`, then `argus profile exec --compose <name> -- tailscale status`. Both work on the old image.
 2. Run `argus profile up <name>` to rebuild on the current `:main`. A lazy session start never rebuilds, so the profile keeps the old image until you do.
 
-Tools the full image had, such as `kubectl`, `gcloud`, `aws` or `git`, now run only on the host. If a profile needs one in the stack, add it to the profile's own Dockerfile.
+Tools the full image had, such as `kubectl`, `gcloud`, `aws`, `git` or `psql`, now run only on the host. If a profile needs one in the stack, add it to the profile's own Dockerfile.
 
 ## Rolling back
 
@@ -235,7 +235,7 @@ Remove the `@sha256:…` pin to follow `:main` again.
 
 tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
-- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- psql -h db-host …`. Raw-TCP tools that can't use a proxy, such as `psql`, must run this way. The image ships `psql`, `nc`, `ping`, `curl`, `jq` and `tailscale` for this; anything beyond them goes in the profile's own Dockerfile.
+- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- nc -z db-host 5432`. Raw-TCP tools that can't use a proxy must run this way. The image ships `nc`, `ping`, `curl`, `jq` and `tailscale` for this; anything beyond them, such as `psql`, goes in the profile's own Dockerfile.
 - **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. The hook exports its address as `ARGUS_TAILNET_PROXY`, and only the tools you point at it use it:
 
   - **kubectl:** set `proxy-url` on each tailnet cluster in the kubeconfig:

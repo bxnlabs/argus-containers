@@ -90,9 +90,9 @@ check_no_agent_proxy() {
 check_net_tools() {
   local out
   if out=$(docker run --rm --user 12345:12345 "$image" sh -c '
-      for c in psql nc ping; do command -v "$c" >/dev/null || { echo "$c is missing"; exit 1; }; done
+      for c in nc ping; do command -v "$c" >/dev/null || { echo "$c is missing"; exit 1; }; done
       ping -c 1 -W 2 127.0.0.1 >/dev/null' 2>&1); then
-    pass "psql, nc and ping are installed; ping works as a non-root user"
+    pass "nc and ping are installed; ping works as a non-root user"
   else
     fail "network tools: $out"
   fi
@@ -128,7 +128,7 @@ check_dropped() {
   local out
   if out=$(docker run --rm "$image" sh -c '
       found=""
-      for c in claude codex omp agy node gcloud aws az pulumi kubectl helm k9s supervisord zsh git; do
+      for c in claude codex omp agy node gcloud aws az pulumi kubectl helm k9s supervisord zsh git psql; do
         command -v "$c" >/dev/null && found="$found $c"
       done
       [ -z "$found" ] || { echo "on PATH:$found"; exit 1; }' 2>&1); then
@@ -139,8 +139,8 @@ check_dropped() {
 }
 
 # The image's uncompressed size, against a budget about 25% over the size it
-# had when the budget was set: 283 MB on arm64 and 264 MB on amd64.
-size_budget_mb=355
+# had when the budget was set: 224 MB on arm64 and 209 MB on amd64.
+size_budget_mb=280
 check_size() {
   local bytes mb
   if ! bytes=$(docker image inspect --format '{{.Size}}' "$image"); then
