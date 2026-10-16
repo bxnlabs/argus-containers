@@ -268,6 +268,45 @@ for case in pass:0 restarted:1 unhealthy:1 operator:1 up-fails:1; do
   rm -rf "$tmp"
 done
 
+# A8: after a netguard restart, the stranded agent fails closed when reached
+# by plain docker exec, and Argus restarts it before the next profile exec
+# --compose, which then reaches the target as the same node. Every probe
+# runs, even after one fails.
+for case in pass:0 leaky-target:1 leaky-internet:1 not-healed:1 unreached:1; do
+  tmp=$(mktemp -d)
+  out=$(MODE=${case%%:*} LOG=$tmp/calls bash -c '
+    . "$1"
+    DEADLINE=0 TARGET_IP=100.64.0.9 NONCE=n CHECK_OUT=""
+    log() { :; }
+    sleep() { :; }
+    timeout() { shift; "$@"; }
+    node_id() { echo n1; }
+    docker() {
+      # The agent restarts on the first profile exec --compose.
+      if [[ $MODE != not-healed && -e $LOG.healed ]]; then echo t2; else echo t1; fi
+    }
+    compose() {
+      printf "compose %s\n" "$*" >>"$LOG"
+      case "$*" in
+        "exec -T agent bash -c "*100.64.0.9*) [[ $MODE == leaky-target ]] && return 1; return 0 ;;
+        "exec -T agent bash -c "*api.tailscale.com*) [[ $MODE == leaky-internet ]] && return 1; return 0 ;;
+        "ps -q agent") echo cid ;;
+      esac
+      return 0
+    }
+    in_stack() {
+      printf "in_stack %s\n" "${*: -1}" >>"$LOG"
+      touch "$LOG.healed"
+      OUT=""
+      [[ $MODE != unreached ]]
+    }
+    a8_identity_and_restart; echo "rc=$?"; printf "%s" "$CHECK_OUT"' _ "$here/../tailnet-separation.sh" 2>/dev/null)
+  eq "a8: ${case%%:*}" "rc=${case#*:}" "$(grep "^rc=" <<<"$out")"
+  eq "a8: ${case%%:*}: both stranded probes by docker exec" 2 "$(grep -c "^compose exec -T agent bash -c " "$tmp/calls")"
+  nok grep -q "compose restart -t 5 agent" "$tmp/calls"
+  rm -rf "$tmp"
+done
+
 # teardown survives a second signal: TERM during the agent logout must not
 # stop it before the target logout.
 tmp=$(mktemp -d)

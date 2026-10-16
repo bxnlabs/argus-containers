@@ -315,7 +315,7 @@ e2e/tailnet-separation.sh --profile acme-test --host-peer 100.x.y.z
 
 The profile's hook must follow the recipe: it exports `ARGUS_TAILNET_PROXY` and no session-wide proxy variables. A7 checks both, and fails against a hook that sets them.
 
-Host requirements: `argus` with a running node, `docker`, `curl`, `jq`, `timeout`, `realpath` (GNU), `python3`, and a host `tailscale` CLI connected to the host's tailnet. It runs on macOS and Linux.
+Host requirements: `argus` with a running node that has bxnlabs/argus#241 (see A8 below), `docker`, `curl`, `jq`, `timeout`, `realpath` (GNU), `python3`, and a host `tailscale` CLI connected to the host's tailnet. It runs on macOS and Linux.
 
 The target node runs the same image as the profile stack's `netguard`, by its image ID, so both sides of the run test the same build. The run logs the image's reference and ID at startup (`target image <ref> (sha256:…)`), which shows a stale image. `--target-image REF` runs the target from `REF` instead:
 
@@ -327,7 +327,7 @@ e2e/tailnet-separation.sh --profile acme-test --host-peer 100.x.y.z \
 
 The run never pulls the target's image. It aborts with exit 2 when the image isn't local.
 
-The script prints one `PASS` or `FAIL` line per assertion (A1–A10). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (accepted subnet routes, or an exit node). A8 restarts and recreates `netguard`. A10 logs the profile out and back in. Concurrent runs are not supported. Teardown logs both nodes out on every exit, reports its own failures, and does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
+The script prints one `PASS` or `FAIL` line per assertion (A1–A10). It exits 0 only when all pass, 1 when any fails, and 2 when it aborts before its assertions. It aborts in preflight if the host routes any tailnet prefix that the profile's `NETGUARD_TAILNET_PREFIXES` does not cover (accepted subnet routes, or an exit node). A8 restarts `netguard`, checks that the agent left in the old network namespace fails closed, then checks that Argus restarts that agent before the next `argus profile exec --compose`, which it does since bxnlabs/argus#241. An older node fails A8, as expected. A8 then recreates `netguard`. A10 logs the profile out and back in. Concurrent runs are not supported. Teardown logs both nodes out on every exit, reports its own failures, and does not change the exit status. If it cannot log the profile out of the test tailnet, the next run stops in preflight until you log the profile out yourself.
 
 ### Testing a branch's image
 

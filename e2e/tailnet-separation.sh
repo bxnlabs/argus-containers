@@ -769,11 +769,28 @@ same_node_after() {
   fi
 }
 
+# stranded_step LABEL CMD: one step of an assertion, run with bash in the
+# agent through plain `docker compose exec`. Unlike `argus profile exec
+# --compose`, that doesn't restart a stranded agent first.
+stranded_step() {
+  local out rc
+  out=$(compose exec -T agent bash -c "$2" </dev/null 2>&1)
+  rc=$?
+  if ((rc != 0)); then
+    CHECK_OUT+="$1 (rc=$rc):"$'\n'"$out"$'\n'
+    return 1
+  fi
+}
+
 # shellcheck disable=SC2016 # these commands expand in the agent
 a8_identity_and_restart() {
-  local failed=0 id
+  local failed=0 id started now
   id=$(node_id) || {
     CHECK_OUT+="cannot read the node ID"$'\n'
+    return 1
+  }
+  started=$(service_started agent) || {
+    CHECK_OUT+="cannot read the agent's start time"$'\n'
     return 1
   }
   if ! compose restart -t 5 netguard >/dev/null 2>&1 || ! wait_until "$DEADLINE" netguard_healthy; then
@@ -781,12 +798,14 @@ a8_identity_and_restart() {
     return 1
   fi
   # The agent still holds the old namespace: it must fail closed.
-  stack_step "a stranded agent cannot reach the target" "$(tmpl 'if curl -fsS --max-time 5 http://@T@:8080/; then echo reached; false; else true; fi' T "$TARGET_IP")" || failed=1
-  stack_step "a stranded agent has no internet" 'if curl -sS -o /dev/null --max-time 5 https://api.tailscale.com/; then echo reached; false; else true; fi' || failed=1
-  if compose restart -t 5 agent >/dev/null 2>&1; then
-    same_node_after "netguard restart, then agent restart" "$id" || failed=1
-  else
-    CHECK_OUT+="restarting the agent failed"$'\n'
+  stranded_step "a stranded agent cannot reach the target" "$(tmpl 'if curl -fsS --max-time 5 http://@T@:8080/; then echo reached; false; else true; fi' T "$TARGET_IP")" || failed=1
+  stranded_step "a stranded agent has no internet" 'if curl -sS -o /dev/null --max-time 5 https://api.tailscale.com/; then echo reached; false; else true; fi' || failed=1
+  # Argus restarts the stranded agent before the next profile exec
+  # --compose (bxnlabs/argus#241), so it reaches the target again.
+  same_node_after "netguard restart" "$id" || failed=1
+  now=$(service_started agent)
+  if [[ -z $now || $now == "$started" ]]; then
+    CHECK_OUT+="Argus did not restart the stranded agent: it started at $started, and now at ${now:-an unreadable time}"$'\n'
     failed=1
   fi
   # A recreate strands the agent until the next up -d recreates it too,
@@ -801,10 +820,10 @@ a8_identity_and_restart() {
   return "$failed"
 }
 
-# netguard_started: when netguard's container last started.
-netguard_started() {
+# service_started SERVICE: when the stack's SERVICE container last started.
+service_started() {
   local id
-  id=$(compose ps -q netguard) && [[ -n $id ]] || return 1
+  id=$(compose ps -q "$1") && [[ -n $id ]] || return 1
   timeout "$STEP_TIMEOUT" docker inspect -f '{{.State.StartedAt}}' "$id"
 }
 
@@ -820,7 +839,7 @@ netguard_operator() {
 # agent can log in again. Leaves the agent logged in, for teardown to log out.
 a10_heals_after_logout() {
   local failed=0 started now op t0
-  started=$(netguard_started) || {
+  started=$(service_started netguard) || {
     CHECK_OUT+="cannot read netguard's start time"$'\n'
     return 1
   }
@@ -832,7 +851,7 @@ a10_heals_after_logout() {
     CHECK_OUT+="netguard did not become healthy within $DEADLINE s of the logout: $(compose exec -T netguard /opt/argus/bin/netguard.sh --check 2>&1)"$'\n'
     failed=1
   fi
-  now=$(netguard_started)
+  now=$(service_started netguard)
   if [[ $now != "$started" ]]; then
     CHECK_OUT+="netguard restarted: it started at $started, and now at ${now:-an unreadable time}"$'\n'
     failed=1
