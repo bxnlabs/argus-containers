@@ -123,7 +123,7 @@ check_agent_idle() {
   docker rm -f "$cid" >/dev/null
 }
 
-# Nothing from the full image creeps back onto PATH.
+# Tools the image leaves out stay off PATH.
 check_dropped() {
   local out
   if out=$(docker run --rm "$image" sh -c '

@@ -159,7 +159,7 @@ docker run --rm -v "$PWD/.tailscale:/s" ghcr.io/bxnlabs/argus-containers/profile
   sh -c 'chown -R 0:0 /s && chmod 0700 /s'
 ```
 
-Run the same `docker run` in a profile that kept its `.tailscale` from before tailscaled moved into `netguard`; that state belongs to the profile user. On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
+On macOS, Docker Desktop and OrbStack map ownership on bind mounts, so this step is harmless but not needed.
 
 ### First start
 
@@ -190,21 +190,6 @@ argus profile up <name>
 ```
 
 To check what the agent got, compare `docker image inspect argus-<name>-agent --format '{{json .Config.Env}}'` with the published image's environment.
-
-## Migrating from the full image
-
-Earlier images also held the agent CLIs, cloud CLIs, development tools and supervisord, and the recipe's `agent` ran `/usr/bin/supervisord`. The current image has no supervisord, so a profile still on that command can't start its `agent` once it is rebuilt on the current `:main`. Docker reports:
-
-```
-Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "/usr/bin/supervisord": stat /usr/bin/supervisord: no such file or directory
-```
-
-Migrate each profile in this order:
-
-1. On the image the profile has now, give `agent` `init: true` and `command: ["sleep", "infinity"]` in `compose.yaml`, and change the Dockerfile's `useradd -s` to `/bin/bash`. Run `argus profile up <name>`, then `argus profile exec --compose <name> -- tailscale status`. Both work on the old image.
-2. Run `argus profile up <name>` to rebuild on the current `:main`. A lazy session start never rebuilds, so the profile keeps the old image until you do.
-
-Tools the full image had, such as `kubectl`, `gcloud`, `aws`, `git` or `psql`, now run only on the host. If a profile needs one in the stack, add it to the profile's own Dockerfile.
 
 ## Rolling back
 
