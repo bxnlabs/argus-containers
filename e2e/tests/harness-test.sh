@@ -214,7 +214,7 @@ rm -rf "$tmp"
 # unreachable_cmd passes only on EHOSTUNREACH or ENETUNREACH. The stubbed
 # timeout stands in for the connect, which bash -c inherits as an exported
 # function.
-# shellcheck disable=SC2329 # invoked by the inner bash
+# shellcheck disable=SC2317,SC2329 # invoked by the inner bash (SC2317 before 0.11)
 timeout() { [[ -n $STUB_OUT ]] && echo "$STUB_OUT"; return "$STUB_RC"; }
 export -f timeout
 for case in "No route to host:1:pass" "Network is unreachable:1:pass" "Connection refused:1:fail" \
