@@ -169,7 +169,9 @@ argus profile up <name>
 
 Sessions run on the host, so agents use the host user's own installs, credentials and settings in the host's `$HOME`, not the image or the profile's `.home`. The profile's `.home` is the `$HOME` of commands run with `argus profile exec --compose`.
 
-To join a tailnet, run `argus profile exec --compose <name> -- tailscale up`. The login persists in `.tailscale/`.
+`argus profile exec --compose` runs the command in the agent in the directory you run it from, so that directory must be one the stack binds at its host path. In the recipe those are `~/Workspace` and the Argus state root (`~/.argus`). Argus refuses any other directory, `~` included: the recipe mounts `.home` over `$HOME`, so the agent's `~` isn't the host's.
+
+To join a tailnet, run `cd ~/Workspace && argus profile exec --compose <name> -- tailscale up`. The login persists in `.tailscale/`.
 
 ## Updating a profile
 
@@ -220,7 +222,7 @@ Remove the `@sha256:…` pin to follow `:main` again.
 
 tailscaled runs in TUN mode in `netguard`. The agent shares `netguard`'s network namespace, so it reaches the profile's tailnet through ordinary kernel routes: raw TCP, UDP, ICMP and MagicDNS names all work, with no proxy and no capabilities in the agent. Anything else goes out directly.
 
-- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, for example `argus profile exec --compose <name> -- nc -z db-host 5432`. Raw-TCP tools that can't use a proxy must run this way. The image ships `nc`, `ping`, `curl`, `jq` and `tailscale` for this; anything beyond them, such as `psql`, goes in the profile's own Dockerfile.
+- **In the stack:** run any tool through `argus profile exec --compose <name> -- …`, from a directory the stack binds at its host path (see [First start](#first-start)), for example `argus profile exec --compose <name> -- nc -z db-host 5432`. Raw-TCP tools that can't use a proxy must run this way. The image ships `nc`, `ping`, `curl`, `jq` and `tailscale` for this; anything beyond them, such as `psql`, goes in the profile's own Dockerfile.
 - **On the host:** sessions reach the tailnet through tailscaled's HTTP and SOCKS5 proxy, which `netguard` publishes on a loopback port. It listens only on the container's bridge address, not the tailnet address, so the profile's tailnet peers can't use it. The proxy resolves MagicDNS names itself, and passes non-tailnet destinations through to the internet. The hook exports its address as `ARGUS_TAILNET_PROXY`, and only the tools you point at it use it:
 
   - **kubectl:** set `proxy-url` on each tailnet cluster in the kubeconfig:
