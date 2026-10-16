@@ -85,7 +85,7 @@ ARG NODE_VERSION=24.22.0
 # renovate: datasource=npm packageName=@anthropic-ai/claude-code
 ARG CLAUDE_CODE_VERSION=2.1.301
 # renovate: datasource=npm packageName=@openai/codex
-ARG CODEX_VERSION=0.162.1
+ARG CODEX_VERSION=0.163.0
 # renovate: datasource=github-releases packageName=can1357/oh-my-pi
 ARG OMP_VERSION=18.11.1
 # Antigravity CLI (agy) has no Renovate datasource. Bump these by hand from the
