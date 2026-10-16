@@ -14,12 +14,6 @@
       "description": "GitHub release tags have a v prefix; the Dockerfile ARGs do not",
       "matchDatasources": ["github-releases"],
       "extractVersion": "^v(?<version>.+)$"
-    },
-    {
-      "description": "Stay on the Node.js major the image ships; move majors by hand",
-      "matchDatasources": ["node-version"],
-      "matchUpdateTypes": ["major"],
-      "enabled": false
     }
   ],
   "customManagers": [
@@ -32,13 +26,5 @@
       ]
     }
   ],
-  "customDatasources": {
-    "gcloud": {
-      "description": "Google Cloud CLI: the rapid channel's current version",
-      "defaultRegistryUrlTemplate": "https://dl.google.com/dl/cloudsdk/channels/rapid/components-2.json",
-      "format": "json",
-      "transformTemplates": ["{\"releases\": [{\"version\": version}]}"]
-    }
-  },
   "automerge": true
 }

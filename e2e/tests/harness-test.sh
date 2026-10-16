@@ -211,6 +211,21 @@ export ALL_PROXY=$p all_proxy=$p HTTP_PROXY=$p http_proxy=$p HTTPS_PROXY=$p http
 kill "$proxy_pid"
 rm -rf "$tmp"
 
+# unreachable_cmd passes only on EHOSTUNREACH or ENETUNREACH. The stubbed
+# timeout stands in for the connect, which bash -c inherits as an exported
+# function.
+# shellcheck disable=SC2329 # invoked by the inner bash
+timeout() { [[ -n $STUB_OUT ]] && echo "$STUB_OUT"; return "$STUB_RC"; }
+export -f timeout
+for case in "No route to host:1:pass" "Network is unreachable:1:pass" "Connection refused:1:fail" \
+  ":124:fail" ":0:fail" "No route to host:124:fail"; do
+  IFS=: read -r msg rc want <<<"$case"
+  got=$(STUB_OUT=${msg:+"bash: connect: $msg"} STUB_RC=$rc bash -c "$(unreachable_cmd 192.0.2.1 22)" >/dev/null && echo pass || echo fail)
+  eq "unreachable: ${msg:-no output}, rc $rc" "$want" "$got"
+done
+unset -f timeout
+eq "unreachable: a real refusal" fail "$(bash -c "$(unreachable_cmd 127.0.0.1 1)" >/dev/null && echo pass || echo fail)"
+
 # tmpl keeps & and backslashes in values literally.
 eq "tmpl" 'curl http://a&b\c:8080/ -o x' "$(tmpl 'curl http://@H@:@P@/ -o x' H 'a&b\c' P 8080)"
 
