@@ -5,10 +5,14 @@
 # neither path reaches the host's own tailnet. Prerequisites and usage:
 # README.md, "Tailnet-separation e2e".
 #
-# Usage: e2e/tailnet-separation.sh --profile NAME --host-peer IP
+# Usage: e2e/tailnet-separation.sh --profile NAME --host-peer IP [--target-image REF]
 #
 # --host-peer is the one host-tailnet address the run probes. It must answer
 # on TCP port 22 from the host. No other host-tailnet address is contacted.
+#
+# The target node runs the image of the profile stack's netguard, so both
+# sides test the same build. --target-image REF runs it from REF instead.
+# Either must be a local image; the run never pulls one.
 #
 # The auth key comes from the profile's compose secret `authkey`. It must be
 # reusable (the run enrolls the target, and the agent twice), ephemeral
@@ -23,7 +27,6 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TARGET_COMPOSE=$REPO_ROOT/e2e/target/compose.yaml
-TARGET_IMAGE=ghcr.io/bxnlabs/argus-containers/profile:main
 POSTGRES_IMAGE=postgres:16-alpine
 HOST_PEER_PORT=22
 DEADLINE=60     # bound for polls, in seconds
@@ -221,31 +224,36 @@ except OSError as e:
 '
 
 parse_args() {
-  PROFILE="" HOST_PEER=""
+  PROFILE="" HOST_PEER="" TARGET_IMAGE_REF=""
+  local flag value
   while (($#)); do
     case $1 in
-      --profile | --host-peer)
-        local flag=$1
-        (($# >= 2)) || die "$flag needs a value"
-        if [[ $flag == --profile ]]; then PROFILE=$2; else HOST_PEER=$2; fi
+      --profile | --host-peer | --target-image)
+        (($# >= 2)) || die "$1 needs a value"
+        flag=$1 value=$2
         shift 2
         ;;
-      --profile=*)
-        PROFILE=${1#*=}
-        shift
-        ;;
-      --host-peer=*)
-        HOST_PEER=${1#*=}
+      --profile=* | --host-peer=* | --target-image=*)
+        flag=${1%%=*} value=${1#*=}
         shift
         ;;
       -h | --help)
-        sed -n '2,21p' "$0"
+        # The header comment, up to the first line that isn't one.
+        awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0"
         exit 0
         ;;
       *) die "unknown argument: $1" ;;
     esac
+    case $flag in
+      --profile) PROFILE=$value ;;
+      --host-peer) HOST_PEER=$value ;;
+      --target-image)
+        [[ -n $value ]] || die "--target-image needs a value"
+        TARGET_IMAGE_REF=$value
+        ;;
+    esac
   done
-  [[ -n $PROFILE && -n $HOST_PEER ]] || die "usage: $0 --profile NAME --host-peer IP"
+  [[ -n $PROFILE && -n $HOST_PEER ]] || die "usage: $0 --profile NAME --host-peer IP [--target-image REF]"
   [[ $PROFILE =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid profile name: $PROFILE"
   if [[ $HOST_PEER == */* ]] || ! cidr_covers 100.64.0.0/10 "$HOST_PEER"; then
     die "--host-peer must be a tailnet IPv4 address in 100.64.0.0/10, got $HOST_PEER"
@@ -262,7 +270,7 @@ init_run() {
   AGENT_HOST=argus-e2e-agent-$RUN_ID
   # Teardown acts only on what these record as this run's.
   TARGET_STARTED=0 OWN_LOGIN=0 STACK_WAS_UP=0 TEARDOWN_ERRORS=0
-  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS="" TS_OPERATOR=""
+  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS="" TS_OPERATOR="" TARGET_IMAGE=""
 }
 
 # compose ARGS...: docker compose against the profile's stack, with the
@@ -412,6 +420,7 @@ preflight_checks() {
   jq -e --arg ip "$HOST_PEER" 'any(.Peer[]?.TailscaleIPs[]?; . == $ip)' >/dev/null <<<"$HOST_STATUS" ||
     die "--host-peer $HOST_PEER is not a peer on the host's tailnet"
   log "host tailnet $HOST_TAILNET; host peer $HOST_PEER; proxy 127.0.0.1:$PROXY_PORT"
+  [[ -z $TARGET_IMAGE_REF ]] || target_image_from_flag
 
   # Without the prefs (an older CLI), assume the host accepts subnet routes.
   route_all=$(timeout "$API_DEADLINE" tailscale debug prefs 2>/dev/null | jq -r '.RouteAll | values' 2>/dev/null)
@@ -433,6 +442,36 @@ login_settled() {
     jq -e '.BackendState != "NoState" and .BackendState != "Starting"' >/dev/null <<<"$LOGIN_STATUS"
 }
 
+# local_image_id REF: the ID of the local image REF. It never pulls.
+local_image_id() {
+  local id
+  id=$(timeout "$STEP_TIMEOUT" docker image inspect -f '{{.Id}}' -- "$1" 2>/dev/null) && [[ -n $id ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# target_image_from_flag: run the target from the local image --target-image
+# names, by its ID.
+target_image_from_flag() {
+  TARGET_IMAGE=$(local_image_id "$TARGET_IMAGE_REF") ||
+    die "--target-image $TARGET_IMAGE_REF is not a local image; pull or build it first"
+  log "target image $TARGET_IMAGE_REF ($TARGET_IMAGE), from --target-image"
+}
+
+# target_image_from_netguard: run the target from the image the profile
+# stack's running netguard container runs, by its ID, so the target has the
+# profile's build of tailscaled and the target's tools.
+target_image_from_netguard() {
+  local cid ref id
+  cid=$(compose ps -q netguard)
+  [[ -n $cid ]] || die "cannot find the profile stack's netguard container"
+  read -r ref id < <(timeout "$STEP_TIMEOUT" docker inspect -f '{{.Config.Image}} {{.Image}}' "$cid" 2>/dev/null)
+  if [[ -z $id ]] || ! local_image_id "$id" >/dev/null; then
+    die "netguard's image ${ref:-(unreadable)} ${id:+($id) }is not a local image"
+  fi
+  TARGET_IMAGE=$id
+  log "target image $ref ($id), the profile's netguard image"
+}
+
 # recover: bring the stack up, refuse a login this e2e does not own, and clean
 # up after earlier crashed runs. tailscaled's state is root's, so its login is
 # read from the running daemon; teardown stops a stack that was down.
@@ -440,6 +479,8 @@ recover() {
   local projects p
   log "bringing the profile's stack up through Argus"
   in_stack -t "$STACK_TIMEOUT" true || die "argus profile exec --compose failed: $OUT"
+  # Before removing leftover targets: their compose file needs an image.
+  [[ -n $TARGET_IMAGE_REF ]] || target_image_from_netguard
   wait_until "$DEADLINE" login_settled || die "tailscaled never loaded its state: $LOGIN_STATUS"
   case $(classify_login "$LOGIN_STATUS" "$HOST_TAILNET") in
     logged-out) ;;

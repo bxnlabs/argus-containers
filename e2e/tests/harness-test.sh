@@ -94,10 +94,100 @@ nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-p
 nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1/32 2>/dev/null"
 ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 && [[ \$HOST_PEER == 100.64.0.1 ]]"
 
+# parse_args: --target-image is optional and needs a value.
+ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 && [[ -z \$TARGET_IMAGE_REF ]]"
+ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 --target-image ghcr.io/o/i:main && [[ \$TARGET_IMAGE_REF == ghcr.io/o/i:main ]]"
+ok bash -c ". '$here/../tailnet-separation.sh'; parse_args --target-image=img:dev --profile p --host-peer 100.64.0.1 && [[ \$TARGET_IMAGE_REF == img:dev ]]"
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 --target-image 2>/dev/null"
+nok bash -c ". '$here/../tailnet-separation.sh'; parse_args --profile p --host-peer 100.64.0.1 --target-image= 2>/dev/null"
+
+# target_image_case MODE FUNC: run FUNC, one of the target image selectors,
+# with docker and compose stubbed as MODE says. Prints the log, then
+# image=TARGET_IMAGE when FUNC returns, then rc=STATUS. Every docker call is
+# recorded in $tmp/calls.
+target_image_case() {
+  MODE=$1 LOG=$tmp/calls bash -c '
+    . "$1"
+    TARGET_IMAGE="" TARGET_IMAGE_REF=img:dev
+    timeout() { shift; "$@"; }
+    docker() {
+      printf "%s\n" "$*" >>"$LOG"
+      case "$*" in
+        "image inspect -f {{.Id}} -- img:dev") [[ $MODE != missing ]] && echo sha256:aaa ;;
+        "inspect -f {{.Config.Image}} {{.Image}} cid") [[ $MODE != no-image ]] && echo "argus-p-netguard sha256:bbb" ;;
+        "image inspect -f {{.Id}} -- sha256:bbb") [[ $MODE != missing ]] && echo sha256:bbb ;;
+        *) return 1 ;;
+      esac
+    }
+    compose() { [[ $* == "ps -q netguard" && $MODE != no-container ]] && echo cid; }
+    "$2" && echo "image=$TARGET_IMAGE"' _ "$here/../tailnet-separation.sh" "$2" 2>&1
+  echo "rc=$?"
+}
+tmp=$(mktemp -d)
+# --target-image runs the local image it names, by ID, and never pulls.
+out=$(target_image_case found target_image_from_flag)
+eq "flag image: selected" $'image=sha256:aaa\nrc=0' "$(tail -n 2 <<<"$out")"
+ok grep -qx '\[e2e\] target image img:dev (sha256:aaa), from --target-image' <<<"$out"
+out=$(target_image_case missing target_image_from_flag)
+eq "flag image: absent aborts" rc=2 "$(tail -n 1 <<<"$out")"
+ok grep -q '^\[e2e\] ABORT: .*img:dev' <<<"$out"
+# Otherwise the target runs the image netguard's container runs.
+out=$(target_image_case found target_image_from_netguard)
+eq "netguard image: selected" $'image=sha256:bbb\nrc=0' "$(tail -n 2 <<<"$out")"
+ok grep -qx "\[e2e\] target image argus-p-netguard (sha256:bbb), the profile's netguard image" <<<"$out"
+for mode in no-container no-image missing; do
+  out=$(target_image_case "$mode" target_image_from_netguard)
+  eq "netguard image: $mode aborts" rc=2 "$(tail -n 1 <<<"$out")"
+  ok grep -q '^\[e2e\] ABORT: ' <<<"$out"
+done
+nok grep -q pull "$tmp/calls"
+rm -rf "$tmp"
+
+# recover_case REF IMAGE: the steps recover takes when --target-image is REF
+# and preflight selected IMAGE.
+recover_case() {
+  local log
+  log=$(mktemp)
+  REF=$1 IMG=$2 LOG=$log bash -c '
+    . "$1"
+    TARGET_IMAGE_REF=$REF TARGET_IMAGE=$IMG HOST_TAILNET=host.example
+    log() { :; }
+    in_stack() { echo stack-up >>"$LOG"; }
+    login_settled() { LOGIN_STATUS="{\"BackendState\":\"NeedsLogin\"}"; }
+    timeout() { shift; "$@"; }
+    docker() { echo "[{\"Name\":\"e2e-tailnet-target-1a2b3c4d\"}]"; }
+    target_image_from_netguard() { echo netguard >>"$LOG"; TARGET_IMAGE=sha256:n; }
+    remove_leftover_targets() { echo "leftovers $TARGET_IMAGE" >>"$LOG"; }
+    recover' _ "$here/../tailnet-separation.sh" >/dev/null 2>&1
+  paste -sd, "$log"
+  rm -f "$log"
+}
+# recover selects netguard's image once the stack is up, and before it
+# removes leftover targets, whose compose file needs an image.
+eq "recover: no flag" "stack-up,netguard,leftovers sha256:n" "$(recover_case "" "")"
+eq "recover: --target-image" "stack-up,leftovers sha256:f" "$(recover_case img:dev sha256:f)"
+
+# When netguard's image can't be found, the run aborts after the stack is
+# up, and teardown brings down a stack that was down before the run.
+tmp=$(mktemp -d)
+LOG=$tmp/calls bash -c '
+  . "$1"
+  log() { :; }
+  preflight_checks() { STACK_WAS_UP=0; }
+  in_stack() { :; }
+  compose() { :; }
+  timeout() { shift; "$@"; }
+  argus() { printf "argus %s\n" "$*" >>"$LOG"; }
+  main --profile p --host-peer 100.64.0.1' _ "$here/../tailnet-separation.sh" >/dev/null 2>&1
+eq "netguard image abort: exit status" 2 "$?"
+eq "netguard image abort: teardown" "argus profile down p" "$(cat "$tmp/calls" 2>/dev/null)"
+rm -rf "$tmp"
+
 # -h prints the header comment and nothing else.
 help=$("$here/../tailnet-separation.sh" -h)
 eq "help: last line" "# run aborts before its assertions." "$(tail -n 1 <<<"$help")"
 eq "help: first line" "# Tailnet-separation e2e for a dockerized Argus profile: the profile's" "$(head -n 1 <<<"$help")"
+ok grep -q -- "--target-image REF" <<<"$help"
 
 # caps_exactly_net_admin reads /proc/<pid>/status text.
 ok caps_exactly_net_admin $'Name:\tx\nCapEff:\t0000000000001000\nCapBnd:\t0000000000001000'
