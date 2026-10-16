@@ -801,13 +801,18 @@ a8_identity_and_restart() {
   stranded_step "a stranded agent cannot reach the target" "$(tmpl 'if curl -fsS --max-time 5 http://@T@:8080/; then echo reached; false; else true; fi' T "$TARGET_IP")" || failed=1
   stranded_step "a stranded agent has no internet" 'if curl -sS -o /dev/null --max-time 5 https://api.tailscale.com/; then echo reached; false; else true; fi' || failed=1
   # Argus restarts the stranded agent before the next profile exec
-  # --compose (bxnlabs/argus#241), so it reaches the target again.
-  same_node_after "netguard restart" "$id" || failed=1
+  # --compose (bxnlabs/argus#241), so that exec succeeds, and the agent
+  # reaches the target again.
+  if ! in_stack true; then
+    CHECK_OUT+="the first profile exec --compose after the netguard restart failed: $OUT"$'\n'
+    failed=1
+  fi
   now=$(service_started agent)
   if [[ -z $now || $now == "$started" ]]; then
     CHECK_OUT+="Argus did not restart the stranded agent: it started at $started, and now at ${now:-an unreadable time}"$'\n'
     failed=1
   fi
+  same_node_after "netguard restart" "$id" || failed=1
   # A recreate strands the agent until the next up -d recreates it too,
   # which is what Argus runs before every exec.
   if compose -t 120 up -d --no-build --force-recreate netguard >/dev/null 2>&1 &&

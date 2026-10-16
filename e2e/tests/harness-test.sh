@@ -271,12 +271,15 @@ done
 # A8: after a netguard restart, the stranded agent fails closed when reached
 # by plain docker exec, and Argus restarts it before the next profile exec
 # --compose, which then reaches the target as the same node. Every probe
-# runs, even after one fails.
-for case in pass:0 leaky-target:1 leaky-internet:1 not-healed:1 unreached:1; do
+# runs, even after one fails. heals-late: the first profile exec --compose
+# fails and a retry heals, which A8 must not accept.
+for case in pass:0 leaky-target:1 leaky-internet:1 not-healed:1 heals-late:1 unreached:1; do
   tmp=$(mktemp -d)
   out=$(MODE=${case%%:*} LOG=$tmp/calls bash -c '
     . "$1"
     DEADLINE=0 TARGET_IP=100.64.0.9 NONCE=n CHECK_OUT=""
+    # Give heals-late a deadline, so the polls retry.
+    [[ $MODE == heals-late ]] && DEADLINE=2
     log() { :; }
     sleep() { :; }
     timeout() { shift; "$@"; }
@@ -296,6 +299,11 @@ for case in pass:0 leaky-target:1 leaky-internet:1 not-healed:1 unreached:1; do
     }
     in_stack() {
       printf "in_stack %s\n" "${*: -1}" >>"$LOG"
+      if [[ $MODE == heals-late && ! -e $LOG.first ]]; then
+        touch "$LOG.first"
+        OUT="exec failed"
+        return 1
+      fi
       touch "$LOG.healed"
       OUT=""
       [[ $MODE != unreached ]]
