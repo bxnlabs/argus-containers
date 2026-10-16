@@ -98,6 +98,17 @@ check_net_tools() {
   fi
 }
 
+# The e2e's target node runs this image and serves its nonce with perl, which
+# perl-base, an Essential package, keeps in it.
+check_perl_socket() {
+  local out
+  if out=$(docker run --rm --user 12345:12345 "$image" perl -MIO::Socket::INET -e1 2>&1); then
+    pass "perl with IO::Socket::INET runs as a non-root user"
+  else
+    fail "perl with IO::Socket::INET, which the e2e target needs: $out"
+  fi
+}
+
 # The agent service runs `sleep infinity` under `init: true` as the profile's
 # user. tini as PID 1 reaps what `docker exec` leaves behind, which a bare
 # `sleep` as PID 1 would leave as zombies.
@@ -302,8 +313,8 @@ expect_unhealthy() {
 }
 
 # The healthcheck covers the operator: a name that resolves to no user, or an
-# operator changed after start, leaves the agent read-only, so the stack must
-# not count as healthy. tailscaled itself accepts any name.
+# operator other than NETGUARD_TS_OPERATOR, leaves the agent read-only, so the
+# stack must not count as healthy. tailscaled itself accepts any name.
 check_netguard_operator_health() {
   local cid
   cid=$(docker run -d "${netguard_args[@]}" -e NETGUARD_TS_OPERATOR=no-such-user \
@@ -313,12 +324,76 @@ check_netguard_operator_health() {
 
   cid=$(docker run -d "${netguard_args[@]}" -e NETGUARD_TS_OPERATOR=nobody \
     --entrypoint /opt/argus/bin/netguard.sh "$image")
-  if retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
-    docker exec "$cid" tailscale set --operator= >/dev/null
-    expect_unhealthy "$cid" "netguard is unhealthy when the operator is cleared"
-  else
+  if ! retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
     fail "netguard with operator nobody never became healthy"
     docker logs --tail 20 "$cid"
+  elif docker exec -e NETGUARD_TS_OPERATOR=root "$cid" /opt/argus/bin/netguard.sh --check >/dev/null 2>&1; then
+    fail "the healthcheck passes when tailscaled's operator is not NETGUARD_TS_OPERATOR"
+  else
+    pass "the healthcheck fails when tailscaled's operator is not NETGUARD_TS_OPERATOR"
+  fi
+  docker rm -f "$cid" >/dev/null
+}
+
+# operator_is CID NAME: tailscaled's operator is NAME, or none when NAME is
+# empty.
+operator_is() {
+  local prefs
+  prefs=$(docker exec "$1" tailscale debug prefs 2>/dev/null) || return 1
+  [[ $(jq -r '.OperatorUser // empty' <<<"$prefs") == "$2" ]]
+}
+
+# repairs_logged CID: how many times netguard has logged an operator repair.
+repairs_logged() {
+  docker logs "$1" 2>&1 | grep -c 'netguard: tailscaled.s operator was'
+}
+
+# startup_done CID: netguard has set the operator at start and logged it.
+startup_done() {
+  docker logs "$1" 2>&1 | grep -q 'may control tailscaled$'
+}
+
+# repaired CID NAME: tailscaled's operator is NAME again, and netguard logged
+# the repair. A value that never changed is not a repair.
+repaired() {
+  operator_is "$1" "$2" && (($(repairs_logged "$1") > 0))
+}
+
+# tailscale logout resets tailscaled's prefs, the operator included. netguard
+# restores the operator without a restart, and logs each repair once. Clearing
+# it by hand as root stands in for the logout, which needs a login first.
+check_netguard_restores_operator() {
+  local cid started
+  cid=$(docker run -d "${netguard_args[@]}" -e NETGUARD_TS_OPERATOR=nobody \
+    --entrypoint /opt/argus/bin/netguard.sh "$image")
+  if ! retry 20 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    fail "netguard with operator nobody never became healthy"
+    docker logs --tail 20 "$cid"
+    docker rm -f "$cid" >/dev/null
+    return
+  fi
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$cid")
+  if ! docker exec "$cid" tailscale set --operator= >/dev/null; then
+    fail "cannot clear the operator as root"
+  elif retry 15 repaired "$cid" nobody && retry 5 docker exec "$cid" /opt/argus/bin/netguard.sh --check; then
+    pass "netguard restores a cleared operator and turns healthy"
+  else
+    fail "netguard did not restore the operator within 20 s: $(docker exec "$cid" /opt/argus/bin/netguard.sh --check 2>&1)"
+    docker logs --tail 20 "$cid"
+  fi
+  if [[ $(docker inspect -f '{{.State.StartedAt}} {{.RestartCount}}' "$cid") == "$started 0" ]]; then
+    pass "netguard repaired the operator without a restart"
+  else
+    fail "netguard restarted"
+  fi
+  # Two more ticks pass, so a repair logged on every tick would show.
+  sleep 11
+  local n
+  n=$(repairs_logged "$cid")
+  if ((n == 1)); then
+    pass "netguard logs the repair once"
+  else
+    fail "netguard logged the repair $n times: $(docker logs --tail 20 "$cid" 2>&1)"
   fi
   docker rm -f "$cid" >/dev/null
 }
@@ -334,6 +409,18 @@ check_netguard_no_operator() {
     docker logs --tail 20 "$cid"
   fi
   expect_read_only "$cid" "with no operator, non-root users are read-only" 65534:65534
+  # An operator someone sets by hand doesn't last. tailscaled starts with no
+  # operator, so the healthcheck passes before netguard's own start-up set;
+  # wait for that, or it would be what clears this one.
+  if ! retry 20 startup_done "$cid"; then
+    fail "netguard never logged who may control tailscaled"
+  elif ! docker exec "$cid" tailscale set --operator=nobody >/dev/null; then
+    fail "cannot set an operator as root"
+  elif retry 15 repaired "$cid" ""; then
+    pass "with no operator, netguard clears one set by hand"
+  else
+    fail "with no operator, netguard left the operator set by hand: $(docker exec "$cid" tailscale debug prefs 2>&1 | jq -r .OperatorUser)"
+  fi
   docker rm -f "$cid" >/dev/null
 }
 
@@ -377,9 +464,11 @@ check_netguard_fails_loudly() {
   docker volume rm -f "$vol" >/dev/null
 }
 
-checks=(check_identity check_runtime_dirs check_no_agent_proxy check_net_tools check_agent_idle check_dropped check_size)
+checks=(check_identity check_runtime_dirs check_no_agent_proxy check_net_tools check_perl_socket check_agent_idle
+  check_dropped check_size)
 if check_tun; then
-  checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_fails_loudly)
+  checks+=(check_netguard check_netguard_no_operator check_netguard_operator_health check_netguard_restores_operator
+    check_netguard_fails_loudly)
 fi
 for c in "${checks[@]}"; do "$c"; done
 

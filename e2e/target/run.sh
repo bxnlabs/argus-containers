@@ -19,6 +19,14 @@ fi
 
 tailscale up --auth-key=file:/run/secrets/authkey --hostname="argus-e2e-target-$RUN_ID"
 
-mkdir -p /srv
-printf '%s' "$NONCE" >/srv/index.html
-exec python3 -m http.server 8080 --directory /srv
+# The image has no python3. perl-base is Essential in Ubuntu, so perl is always
+# there. One listening socket serves the probes in turn.
+# shellcheck disable=SC2016 # perl code, not shell
+exec perl -MIO::Socket::INET -e '
+  my $s = IO::Socket::INET->new(LocalPort => 8080, Listen => 16, ReuseAddr => 1) or die "listen: $!\n";
+  while (my $c = $s->accept) {
+    while (my $l = <$c>) { last if $l =~ /^\r?\n$/ }
+    print $c "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " . length($ENV{NONCE}) .
+      "\r\nConnection: close\r\n\r\n$ENV{NONCE}";
+    close $c;
+  }'

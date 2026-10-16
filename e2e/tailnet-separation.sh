@@ -11,8 +11,8 @@
 # on TCP port 22 from the host. No other host-tailnet address is contacted.
 #
 # The auth key comes from the profile's compose secret `authkey`. It must be
-# reusable (the run enrolls two nodes), ephemeral (logout removes them) and
-# pre-approved. The script never reads it.
+# reusable (the run enrolls the target, and the agent twice), ephemeral
+# (logout removes them) and pre-approved. The script never reads it.
 #
 # The profile's post_create hook must follow the README's recipe: it exports
 # ARGUS_TAILNET_PROXY and no session-wide proxy variables. A7 checks both.
@@ -262,7 +262,7 @@ init_run() {
   AGENT_HOST=argus-e2e-agent-$RUN_ID
   # Teardown acts only on what these record as this run's.
   TARGET_STARTED=0 OWN_LOGIN=0 STACK_WAS_UP=0 TEARDOWN_ERRORS=0
-  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS=""
+  TARGET_IP="" TARGET_NAME="" OUT="" LOGIN_STATUS="" TS_OPERATOR=""
 }
 
 # compose ARGS...: docker compose against the profile's stack, with the
@@ -395,8 +395,8 @@ preflight_checks() {
   jq -e '.services.netguard and .services.agent' >/dev/null <<<"$CONFIG_JSON" ||
     die "$COMPOSE_FILE needs a netguard and an agent service"
   GUARD_PREFIXES=$(jq -r --arg d "$DEFAULT_GUARD_PREFIXES" '.services.netguard.environment.NETGUARD_TAILNET_PREFIXES // $d' <<<"$CONFIG_JSON")
-  jq -e '(.services.netguard.environment.NETGUARD_TS_OPERATOR // "") != ""' >/dev/null <<<"$CONFIG_JSON" ||
-    die "netguard does not set NETGUARD_TS_OPERATOR, so the agent cannot run tailscale up"
+  TS_OPERATOR=$(jq -r '.services.netguard.environment.NETGUARD_TS_OPERATOR // empty' <<<"$CONFIG_JSON")
+  [[ -n $TS_OPERATOR ]] || die "netguard does not set NETGUARD_TS_OPERATOR, so the agent cannot run tailscale up"
   PROXY_PORT=$(proxy_port "$CONFIG_JSON") || die "netguard does not publish port 1055 on 127.0.0.1"
   KEY_FILE=$(authkey_file "$CONFIG_JSON") || die "the agent does not mount a compose secret named authkey"
   [[ -f $KEY_FILE && -r $KEY_FILE ]] || die "the authkey secret's file $KEY_FILE is missing or unreadable"
@@ -505,6 +505,11 @@ start_target() {
   log "target $TARGET_NAME ($TARGET_IP)"
 }
 
+# agent_up: log in from the agent with the authkey secret. Sets OUT.
+agent_up() {
+  in_stack -t 60 "timeout -k 5 45 tailscale up --auth-key=file:/run/secrets/authkey --hostname=$AGENT_HOST"
+}
+
 daemon_needs_login() {
   in_stack -t "$API_DEADLINE" 'tailscale status --json | jq -e ".BackendState == \"NeedsLogin\"" >/dev/null'
 }
@@ -521,8 +526,7 @@ start_agent() {
   # logged out, or logged out the abandoned e2e login.
   OWN_LOGIN=1
   log "enrolling $AGENT_HOST from the agent"
-  in_stack -t 60 "timeout -k 5 45 tailscale up --auth-key=file:/run/secrets/authkey --hostname=$AGENT_HOST" ||
-    { log "tailscale up from the agent failed: $OUT"; return 1; }
+  agent_up || { log "tailscale up from the agent failed: $OUT"; return 1; }
   wait_until "$DEADLINE" agent_logged_in || { log "the agent never came up as $AGENT_HOST: $OUT"; return 1; }
 }
 
@@ -754,6 +758,57 @@ a8_identity_and_restart() {
   return "$failed"
 }
 
+# netguard_started: when netguard's container last started.
+netguard_started() {
+  local id
+  id=$(compose ps -q netguard) && [[ -n $id ]] || return 1
+  timeout "$STEP_TIMEOUT" docker inspect -f '{{.State.StartedAt}}' "$id"
+}
+
+# netguard_operator: tailscaled's operator, read as root in netguard.
+netguard_operator() {
+  local prefs
+  prefs=$(compose exec -T netguard tailscale debug prefs 2>/dev/null) || return 1
+  jq -r '.OperatorUser // empty' <<<"$prefs"
+}
+
+# a10_heals_after_logout: tailscale logout resets tailscaled's prefs, the
+# operator included. netguard restores the operator without a restart, so the
+# agent can log in again. Leaves the agent logged in, for teardown to log out.
+a10_heals_after_logout() {
+  local failed=0 started now op t0
+  started=$(netguard_started) || {
+    CHECK_OUT+="cannot read netguard's start time"$'\n'
+    return 1
+  }
+  stack_step "tailscale logout from the agent" 'tailscale logout' || return 1
+  t0=$SECONDS
+  if wait_until "$DEADLINE" netguard_healthy; then
+    log "netguard was healthy again $((SECONDS - t0)) s after the logout"
+  else
+    CHECK_OUT+="netguard did not become healthy within $DEADLINE s of the logout: $(compose exec -T netguard /opt/argus/bin/netguard.sh --check 2>&1)"$'\n'
+    failed=1
+  fi
+  now=$(netguard_started)
+  if [[ $now != "$started" ]]; then
+    CHECK_OUT+="netguard restarted: it started at $started, and now at ${now:-an unreadable time}"$'\n'
+    failed=1
+  fi
+  op=$(netguard_operator)
+  if [[ $op != "$TS_OPERATOR" ]]; then
+    CHECK_OUT+="tailscaled's operator is '$op', not '$TS_OPERATOR'"$'\n'
+    failed=1
+  fi
+  if ! agent_up; then
+    CHECK_OUT+="tailscale up from the agent after the logout:"$'\n'"$OUT"$'\n'
+    failed=1
+  elif ! wait_until "$DEADLINE" agent_logged_in; then
+    CHECK_OUT+="the agent never came back up as $AGENT_HOST: $OUT"$'\n'
+    failed=1
+  fi
+  return "$failed"
+}
+
 check_host_status() {
   local st
   st=$(timeout "$API_DEADLINE" tailscale status --json) || return 1
@@ -778,6 +833,7 @@ run_assertions() {
   assert A7 "the post_create hook exports ARGUS_TAILNET_PROXY and nothing session-wide" a7_hook_exports_tailnet_proxy
   assert A8 "the node keeps its identity across a netguard restart and recreate" a8_identity_and_restart
   assert A9 "the host is unaffected" a9_host_unaffected
+  assert A10 "netguard heals after a logout, and the agent logs in again" a10_heals_after_logout
 }
 
 # td NAME CMD...: run one teardown step. Report a failure and carry on.
