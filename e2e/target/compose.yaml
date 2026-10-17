@@ -2,7 +2,8 @@
 # nonce over HTTP on 8080 and a trust-auth PostgreSQL on 5432. The node runs
 # tailscaled in userspace mode, which hands inbound tailnet connections to the
 # services sharing its network namespace. tailnet-separation.sh sets every
-# variable below.
+# variable below. E2E_TARGET_IMAGE is the ID of a local image, which it
+# checks before the run, so the node never pulls.
 secrets:
   authkey:
     file: ${E2E_KEY_FILE}
@@ -10,6 +11,7 @@ secrets:
 services:
   node:
     image: ${E2E_TARGET_IMAGE}
+    pull_policy: never
     user: root
     entrypoint: ["/e2e/run.sh"]
     environment:
