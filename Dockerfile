@@ -34,7 +34,7 @@ COPY rootfs/ /
 ARG TARGETARCH
 
 # renovate: datasource=github-releases packageName=tailscale/tailscale
-ARG TAILSCALE_VERSION=1.104.2
+ARG TAILSCALE_VERSION=1.104.4
 
 # Tailscale (static binaries: tailscaled runs in netguard; the tailscale CLI
 # also works from the agent over the shared socket)
