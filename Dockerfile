@@ -4,7 +4,7 @@
 # profile: the published image. No user and no HOME: a profile adds its own
 # user, because Argus runs the agent as the host's uid and gid.
 ############################
-FROM ubuntu:26.04@sha256:065aa8626841f16057b78b027b464cd59c4fac36c204c72dcbf48d66f5fa8a96 AS profile
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db AS profile
 
 LABEL org.opencontainers.image.source=https://github.com/bxnlabs/argus-containers
 
